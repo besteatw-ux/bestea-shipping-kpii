@@ -8,10 +8,15 @@ import React, {
 
 /* ─────────────────────────────────────────────
    BESTEA 出貨暨庫存管理 KPI 試算工具
-   最終定案版 — CodeSandbox-ready
+   v3.0 — 合併版
+   主要變更：
+   1. 新增「當月訂單量」欄位（最低基準 1,000 筆）
+   2. 合併「出貨正確率 + 包裝客訴」→「出貨包裝正確率」(55 分)
+   3. 出貨包裝採比率制 5 階梯（0% / 0.1% / 0.2% / 0.3% / ≥0.4%）
+   4. 總分 < 40 分 → 獎金歸零
    ───────────────────────────────────────────── */
 
-// ── Icons (inline SVG to avoid dependency issues in CodeSandbox) ──
+// ── Icons (inline SVG) ──
 const Icon = ({ d, size = 20, color = "currentColor", strokeWidth = 2 }) => (
   <svg
     width={size}
@@ -34,9 +39,6 @@ const Icons = {
   users: () => (
     <Icon d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2 M9 3a4 4 0 110 8 4 4 0 010-8z M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
   ),
-  check: () => (
-    <Icon d="M22 11.08V12a10 10 0 11-5.93-9.14 M22 4L12 14.01l-3-3" />
-  ),
   alert: () => (
     <Icon d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z M12 9v4M12 17h.01" />
   ),
@@ -47,21 +49,53 @@ const Icons = {
   info: () => (
     <Icon d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z M12 16v-4M12 8h.01" />
   ),
-  minus: () => <Icon d="M5 12h14" />,
-  plus: () => <Icon d="M12 5v14M5 12h14" />,
   crown: () => (
     <Icon d="M2 20h20 M4 20l2-14 4 6 2-8 2 8 4-6 2 14" strokeWidth={1.8} />
   ),
+  ban: () => (
+    <Icon d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z M4.93 4.93l14.14 14.14" />
+  ),
 };
 
-// ── Scoring Rules Reference (from the official document) ──
-const RULES = {
-  shipping: [
-    { range: "0 件", score: 35, color: "#22c55e" },
-    { range: "1 件", score: 30, color: "#eab308" },
-    { range: "2 件", score: 18, color: "#f97316" },
-    { range: "≥3 件", score: 0, color: "#ef4444" },
+// ── 比率制門檻（以每 1,000 筆為基準） ──
+// 合併「出貨正確率 + 包裝客訴」= 55 分（原 35 + 20）
+const RATE_THRESHOLDS = {
+  fulfillmentQuality: [
+    { maxRate: 0, score: 55, label: "0%（0 件）" },
+    { maxRate: 0.001, score: 48, label: "0.1%（1 件 / 1000）" },
+    { maxRate: 0.002, score: 36, label: "0.2%（2 件 / 1000）" },
+    { maxRate: 0.003, score: 22, label: "0.3%（3 件 / 1000）" },
+    { maxRate: 0.004, score: 10, label: "0.4%（4 件 / 1000）" },
+    { maxRate: Infinity, score: 0, label: "≥0.5%（5 件 / 1000）" },
   ],
+};
+
+// ── 比率制計分函式 ──
+function scoreByRate(errorCount, orderCount, thresholds) {
+  // 最低基準 1,000 筆
+  const baseOrders = Math.max(orderCount, 1000);
+  const errorRate = errorCount / baseOrders;
+  for (const tier of thresholds) {
+    if (errorRate <= tier.maxRate) return tier.score;
+  }
+  return 0;
+}
+
+// ── 計算實際歸零所需件數（用於提示） ──
+function calculateThresholdCounts(orderCount) {
+  const baseOrders = Math.max(orderCount, 1000);
+  return {
+    fq_full: 0,
+    fq_48: Math.floor(baseOrders * 0.001),
+    fq_36: Math.floor(baseOrders * 0.002),
+    fq_22: Math.floor(baseOrders * 0.003),
+    fq_10: Math.floor(baseOrders * 0.004),
+    fq_zero: Math.floor(baseOrders * 0.004) + 1,
+  };
+}
+
+// ── Tooltip 規則組 ──
+const STATIC_RULES = {
   fulfillment: [
     { range: "0 件", score: 25, color: "#22c55e" },
     { range: "≥1 件", score: 0, color: "#ef4444" },
@@ -70,15 +104,8 @@ const RULES = {
     { range: "0 件（無事故）", score: 20, color: "#22c55e" },
     { range: "≥1 件 或 事故", score: 0, color: "#ef4444" },
   ],
-  packaging: [
-    { range: "0 件", score: 20, color: "#22c55e" },
-    { range: "1 件", score: 14, color: "#eab308" },
-    { range: "2 件", score: 8, color: "#f97316" },
-    { range: "≥3 件", score: 0, color: "#ef4444" },
-  ],
 };
 
-// ── Mini rule tooltip component ──
 const RuleTooltip = ({ rules, isOpen, onToggle }) => (
   <div style={{ position: "relative", display: "inline-block" }}>
     <button
@@ -88,11 +115,8 @@ const RuleTooltip = ({ rules, isOpen, onToggle }) => (
         border: "none",
         cursor: "pointer",
         opacity: 0.4,
-        transition: "opacity 0.2s",
         padding: "2px",
       }}
-      onMouseEnter={(e) => (e.target.style.opacity = 1)}
-      onMouseLeave={(e) => (e.target.style.opacity = isOpen ? 1 : 0.4)}
       title="查看評分規則"
     >
       <Icons.info />
@@ -110,11 +134,10 @@ const RuleTooltip = ({ rules, isOpen, onToggle }) => (
           borderRadius: 12,
           padding: "12px 16px",
           zIndex: 50,
-          minWidth: 180,
+          minWidth: 220,
           boxShadow: "0 20px 40px rgba(0,0,0,0.3)",
           fontSize: 12,
           lineHeight: 1.6,
-          animation: "fadeIn 0.15s ease-out",
         }}
       >
         <div
@@ -137,30 +160,18 @@ const RuleTooltip = ({ rules, isOpen, onToggle }) => (
               gap: 16,
             }}
           >
-            <span>{r.range}</span>
-            <span style={{ fontWeight: 700, color: r.color }}>
+            <span>{r.range || r.label}</span>
+            <span style={{ fontWeight: 700, color: r.color || "#22c55e" }}>
               {r.score} 分
             </span>
           </div>
         ))}
-        <div
-          style={{
-            position: "absolute",
-            top: -6,
-            left: "50%",
-            transform: "translateX(-50%)",
-            width: 12,
-            height: 12,
-            background: "#1e293b",
-            transform: "translateX(-50%) rotate(45deg)",
-          }}
-        />
       </div>
     )}
   </div>
 );
 
-// ── Number stepper component ──
+// ── Stepper ──
 const Stepper = ({ value, onChange, danger }) => {
   const btnStyle = {
     width: 40,
@@ -172,7 +183,6 @@ const Stepper = ({ value, onChange, danger }) => {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    transition: "all 0.15s",
     color: "#64748b",
     fontSize: 18,
     fontWeight: 600,
@@ -182,14 +192,6 @@ const Stepper = ({ value, onChange, danger }) => {
       <button
         style={btnStyle}
         onClick={() => onChange(Math.max(0, value - 1))}
-        onMouseEnter={(e) => {
-          e.target.style.background = "#f8fafc";
-          e.target.style.borderColor = "#cbd5e1";
-        }}
-        onMouseLeave={(e) => {
-          e.target.style.background = "#fff";
-          e.target.style.borderColor = "#e2e8f0";
-        }}
       >
         −
       </button>
@@ -201,30 +203,18 @@ const Stepper = ({ value, onChange, danger }) => {
           fontWeight: 800,
           fontVariantNumeric: "tabular-nums",
           color: danger ? "#ef4444" : "#22c55e",
-          transition: "color 0.2s",
         }}
       >
         {value}
       </span>
-      <button
-        style={btnStyle}
-        onClick={() => onChange(value + 1)}
-        onMouseEnter={(e) => {
-          e.target.style.background = "#f8fafc";
-          e.target.style.borderColor = "#cbd5e1";
-        }}
-        onMouseLeave={(e) => {
-          e.target.style.background = "#fff";
-          e.target.style.borderColor = "#e2e8f0";
-        }}
-      >
+      <button style={btnStyle} onClick={() => onChange(value + 1)}>
         +
       </button>
     </div>
   );
 };
 
-// ── Score badge component ──
+// ── ScoreBadge ──
 const ScoreBadge = ({ score, max }) => {
   const pct = score / max;
   const bg = pct === 1 ? "#dcfce7" : pct >= 0.5 ? "#fef9c3" : "#fee2e2";
@@ -237,7 +227,6 @@ const ScoreBadge = ({ score, max }) => {
         padding: "6px 14px",
         textAlign: "center",
         minWidth: 72,
-        transition: "all 0.3s",
       }}
     >
       <div
@@ -268,8 +257,8 @@ const ScoreBadge = ({ score, max }) => {
   );
 };
 
-// ── localStorage helpers ──
-const STORAGE_KEY = "bestea-kpi-data";
+const STORAGE_KEY = "bestea-kpi-data-v2";
+const MIN_THRESHOLD_SCORE = 40; // 低於此分數獎金歸零
 
 function loadSaved() {
   try {
@@ -284,9 +273,7 @@ function loadSaved() {
 function saveToDisk(data) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch {
-    /* quota exceeded — silently fail */
-  }
+  } catch {}
 }
 
 // ── Main App ──
@@ -294,17 +281,17 @@ export default function App() {
   const saved = useRef(loadSaved());
   const s = saved.current;
 
-  const [revenue, setRevenue] = useState(s?.revenue ?? 3500000);
-  const [staffMode, setStaffMode] = useState(s?.staffMode ?? "2_even");
-  const [shippingErrors, setShippingErrors] = useState(s?.shippingErrors ?? 0);
+  const [revenue, setRevenue] = useState(s?.revenue ?? 1940000);
+  const [orderCount, setOrderCount] = useState(s?.orderCount ?? 600);
+  const [staffMode, setStaffMode] = useState(s?.staffMode ?? "3_even");
+  const [fulfillmentQualityErrors, setFulfillmentQualityErrors] = useState(
+    s?.fulfillmentQualityErrors ?? 0
+  );
   const [fulfillmentErrors, setFulfillmentErrors] = useState(
     s?.fulfillmentErrors ?? 0
   );
   const [inventoryErrors, setInventoryErrors] = useState(
     s?.inventoryErrors ?? 0
-  );
-  const [packagingErrors, setPackagingErrors] = useState(
-    s?.packagingErrors ?? 0
   );
   const [inventoryIncident, setInventoryIncident] = useState(
     s?.inventoryIncident ?? false
@@ -312,17 +299,15 @@ export default function App() {
   const [openTooltip, setOpenTooltip] = useState(null);
   const [showSaved, setShowSaved] = useState(false);
 
-  // Auto-save on every change (debounced visual feedback)
   useEffect(() => {
     const data = {
       revenue,
+      orderCount,
       staffMode,
-      shippingErrors,
+      fulfillmentQualityErrors,
       fulfillmentErrors,
       inventoryErrors,
-      packagingErrors,
       inventoryIncident,
-      lastSaved: new Date().toISOString(),
     };
     saveToDisk(data);
     setShowSaved(true);
@@ -330,73 +315,70 @@ export default function App() {
     return () => clearTimeout(t);
   }, [
     revenue,
+    orderCount,
     staffMode,
-    shippingErrors,
+    fulfillmentQualityErrors,
     fulfillmentErrors,
     inventoryErrors,
-    packagingErrors,
     inventoryIncident,
   ]);
 
   const handleReset = useCallback(() => {
-    if (!confirm("確定要清除所有數據，恢復預設值嗎？")) return;
-    setRevenue(3500000);
-    setStaffMode("2_even");
-    setShippingErrors(0);
+    if (!window.confirm("確定要清除所有數據，恢復預設值嗎？")) return;
+    setRevenue(1940000);
+    setOrderCount(600);
+    setStaffMode("3_even");
+    setFulfillmentQualityErrors(0);
     setFulfillmentErrors(0);
     setInventoryErrors(0);
-    setPackagingErrors(0);
     setInventoryIncident(false);
     localStorage.removeItem(STORAGE_KEY);
   }, []);
 
+  const thresholdCounts = useMemo(
+    () => calculateThresholdCounts(orderCount),
+    [orderCount]
+  );
+
   const results = useMemo(() => {
-    // ① 出貨正確率 (35分)
-    let shipScore = 0;
-    if (shippingErrors === 0) shipScore = 35;
-    else if (shippingErrors === 1) shipScore = 30;
-    else if (shippingErrors === 2) shipScore = 18;
-    else shipScore = 0; // 3件（含）以上
+    // ① 出貨包裝正確率（55分）— 比率制（合併出貨+包裝）
+    const fulfillmentQualityScore = scoreByRate(
+      fulfillmentQualityErrors,
+      orderCount,
+      RATE_THRESHOLDS.fulfillmentQuality
+    );
 
-    // ② 訂單履行時效 (25分) — 一律歸零制
-    let fulfillmentScore = fulfillmentErrors === 0 ? 25 : 0;
+    // ② 訂單履行時效（25分）— 維持 1 件歸零
+    const fulfillmentScore = fulfillmentErrors === 0 ? 25 : 0;
 
-    // ③ 庫存管理穩定度 (20分) — 門檻制 + 營運事故條款
-    let inventoryScore = 0;
-    if (!inventoryIncident && inventoryErrors === 0) {
-      inventoryScore = 20;
-    }
-
-    // ④ 包裝責任客訴 (20分)
-    let packageScore = 0;
-    if (packagingErrors === 0) packageScore = 20;
-    else if (packagingErrors === 1) packageScore = 14;
-    else if (packagingErrors === 2) packageScore = 8;
-    else packageScore = 0; // 3件（含）以上
+    // ③ 庫存管理穩定度（20分）— 維持 1 件歸零 + 事故條款
+    const inventoryScore =
+      !inventoryIncident && inventoryErrors === 0 ? 20 : 0;
 
     const rawTotalScore =
-      shipScore + fulfillmentScore + inventoryScore + packageScore;
+      fulfillmentQualityScore + fulfillmentScore + inventoryScore;
 
-    // 品質穩定月判定（需同時符合全部條件）
+    // 品質穩定月（全項目零錯誤）
     const isQualityMonth =
-      shippingErrors === 0 &&
+      fulfillmentQualityErrors === 0 &&
       fulfillmentErrors === 0 &&
       inventoryErrors === 0 &&
-      !inventoryIncident &&
-      packagingErrors === 0;
+      !inventoryIncident;
 
-    // 加成後分數（上限120）
+    // 加成後分數（上限 120）
     const finalScore = isQualityMonth
       ? Math.min(rawTotalScore * 1.2, 120)
       : rawTotalScore;
 
-    // 獎金池 = 營收 × 0.1%
+    // < 40 分 → 獎金歸零
+    const isBelowThreshold = finalScore < MIN_THRESHOLD_SCORE;
+
     const bonusPool = Math.round(revenue * 0.001);
 
-    // 實際可分獎金 = 獎金池 × (最終得分 ÷ 100)
-    const actualTotalBonus = Math.round(bonusPool * (finalScore / 100));
+    const actualTotalBonus = isBelowThreshold
+      ? 0
+      : Math.round(bonusPool * (finalScore / 100));
 
-    // 人員分配
     let staffDistribution = [];
     if (staffMode === "2_even") {
       const per = Math.round(actualTotalBonus / 2);
@@ -436,31 +418,31 @@ export default function App() {
     }
 
     return {
-      scores: { shipScore, fulfillmentScore, inventoryScore, packageScore },
+      scores: {
+        fulfillmentQualityScore,
+        fulfillmentScore,
+        inventoryScore,
+      },
       rawTotalScore,
       finalScore,
       isQualityMonth,
+      isBelowThreshold,
       bonusPool,
       actualTotalBonus,
       staffDistribution,
     };
   }, [
     revenue,
+    orderCount,
     staffMode,
-    shippingErrors,
+    fulfillmentQualityErrors,
     fulfillmentErrors,
     inventoryErrors,
-    packagingErrors,
     inventoryIncident,
   ]);
 
-  const scoreColor = results.isQualityMonth
-    ? "#059669"
-    : results.finalScore >= 80
-    ? "#2563eb"
-    : results.finalScore >= 60
-    ? "#d97706"
-    : "#dc2626";
+  const baseOrdersDisplay = Math.max(orderCount, 1000);
+  const isUsingMinBase = orderCount < 1000;
 
   return (
     <div
@@ -479,12 +461,7 @@ export default function App() {
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
-        @keyframes shimmer { 0% { background-position: -200% center; } 100% { background-position: 200% center; } }
-        @keyframes scoreIn { 
-          0% { transform: scale(0.8); opacity: 0; } 
-          60% { transform: scale(1.05); } 
-          100% { transform: scale(1); opacity: 1; } 
-        }
+        @keyframes scoreIn { 0% { transform: scale(0.8); opacity: 0; } 60% { transform: scale(1.05); } 100% { transform: scale(1); opacity: 1; } }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         input[type=number]::-webkit-inner-spin-button,
         input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
@@ -492,7 +469,7 @@ export default function App() {
       `}</style>
 
       <div style={{ maxWidth: 1120, margin: "0 auto" }}>
-        {/* ═══ HEADER ═══ */}
+        {/* HEADER */}
         <header
           style={{
             display: "flex",
@@ -520,7 +497,7 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
-              <Icons.package /> BESTEA 內部管理
+              <Icons.package /> BESTEA 內部管理 ・ v3.1
             </div>
             <h1
               style={{
@@ -545,7 +522,7 @@ export default function App() {
                 gap: 10,
               }}
             >
-              最終定案版 ・ 自動化獎金核算工具
+              比率制 ・ 最低基準 1,000 筆 ・ 總分 {MIN_THRESHOLD_SCORE} 分為獎金門檻
               {showSaved && (
                 <span
                   style={{
@@ -574,22 +551,13 @@ export default function App() {
                 borderRadius: 8,
                 padding: "4px 12px",
                 cursor: "pointer",
-                transition: "all 0.15s",
-              }}
-              onMouseEnter={(e) => {
-                e.target.style.color = "#ef4444";
-                e.target.style.borderColor = "#fca5a5";
-              }}
-              onMouseLeave={(e) => {
-                e.target.style.color = "#94a3b8";
-                e.target.style.borderColor = "#e2e8f0";
               }}
             >
               清除數據並重置
             </button>
           </div>
 
-          {/* Revenue Input */}
+          {/* Revenue + Orders */}
           <div
             style={{
               background: "#fff",
@@ -601,6 +569,7 @@ export default function App() {
               display: "flex",
               alignItems: "center",
               gap: 24,
+              flexWrap: "wrap",
             }}
           >
             <div>
@@ -620,12 +589,12 @@ export default function App() {
                 value={revenue}
                 onChange={(e) => setRevenue(Number(e.target.value) || 0)}
                 style={{
-                  fontSize: 24,
+                  fontSize: 22,
                   fontWeight: 800,
                   color: "#1e293b",
                   border: "none",
                   outline: "none",
-                  width: 160,
+                  width: 140,
                   background: "transparent",
                   fontFamily: "inherit",
                   fontVariantNumeric: "tabular-nums",
@@ -643,11 +612,53 @@ export default function App() {
                   marginBottom: 4,
                 }}
               >
+                當月訂單量
+              </div>
+              <input
+                type="number"
+                value={orderCount}
+                onChange={(e) => setOrderCount(Number(e.target.value) || 0)}
+                style={{
+                  fontSize: 22,
+                  fontWeight: 800,
+                  color: isUsingMinBase ? "#d97706" : "#1e293b",
+                  border: "none",
+                  outline: "none",
+                  width: 100,
+                  background: "transparent",
+                  fontFamily: "inherit",
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              />
+              <div
+                style={{
+                  fontSize: 9,
+                  fontWeight: 600,
+                  color: isUsingMinBase ? "#d97706" : "#94a3b8",
+                  marginTop: 2,
+                }}
+              >
+                {isUsingMinBase
+                  ? `⚠ <1000 筆，計分基準採 1,000`
+                  : `計分基準：${baseOrdersDisplay.toLocaleString()} 筆`}
+              </div>
+            </div>
+            <div style={{ width: 1, height: 40, background: "#e2e8f0" }} />
+            <div>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: "#94a3b8",
+                  letterSpacing: "0.08em",
+                  marginBottom: 4,
+                }}
+              >
                 獎金池 (0.1%)
               </div>
               <div
                 style={{
-                  fontSize: 24,
+                  fontSize: 22,
                   fontWeight: 800,
                   color: "#2563eb",
                   fontVariantNumeric: "tabular-nums",
@@ -659,7 +670,7 @@ export default function App() {
           </div>
         </header>
 
-        {/* ═══ MAIN GRID ═══ */}
+        {/* MAIN GRID */}
         <div
           style={{
             display: "grid",
@@ -668,7 +679,7 @@ export default function App() {
             alignItems: "start",
           }}
         >
-          {/* ── LEFT: KPI Inputs ── */}
+          {/* LEFT */}
           <div
             style={{
               display: "flex",
@@ -677,7 +688,6 @@ export default function App() {
               animation: "slideUp 0.6s ease-out",
             }}
           >
-            {/* KPI Card */}
             <div
               style={{
                 background: "#fff",
@@ -696,6 +706,8 @@ export default function App() {
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: 8,
                 }}
               >
                 <span
@@ -705,38 +717,55 @@ export default function App() {
                     letterSpacing: "0.02em",
                   }}
                 >
-                  KPI 扣分項錄入（件數制）
+                  KPI 扣分項錄入
                 </span>
                 <span
                   style={{ fontSize: 11, color: "#94a3b8", fontWeight: 500 }}
                 >
-                  以每 1,000 筆訂單計
+                  比率以 {baseOrdersDisplay.toLocaleString()} 筆為基準計算
                 </span>
               </div>
 
               <div style={{ padding: "8px 0" }}>
-                {/* ① Shipping */}
+                {/* ① 出貨包裝正確率（合併版）— 比率制 */}
                 <KpiRow
-                  title="出貨正確率"
-                  subtitle="裝錯、少裝、多裝件數"
-                  weight={35}
-                  score={results.scores.shipScore}
-                  maxScore={35}
-                  value={shippingErrors}
-                  onChange={setShippingErrors}
-                  rules={RULES.shipping}
+                  title="出貨包裝正確率"
+                  subtitle="裝錯、少裝、多裝、貼錯標籤、缺漏、備註未看"
+                  weight={55}
+                  score={results.scores.fulfillmentQualityScore}
+                  maxScore={55}
+                  value={fulfillmentQualityErrors}
+                  onChange={setFulfillmentQualityErrors}
+                  rules={RATE_THRESHOLDS.fulfillmentQuality.map((r) => ({
+                    range: r.label,
+                    score: r.score,
+                    color:
+                      r.score === 55
+                        ? "#22c55e"
+                        : r.score >= 36
+                        ? "#eab308"
+                        : r.score >= 10
+                        ? "#f97316"
+                        : "#ef4444",
+                  }))}
                   openTooltip={openTooltip}
-                  tooltipKey="ship"
+                  tooltipKey="fq"
                   onToggleTooltip={() =>
-                    setOpenTooltip(openTooltip === "ship" ? null : "ship")
+                    setOpenTooltip(openTooltip === "fq" ? null : "fq")
                   }
+                  hint={`歸零 ≥${thresholdCounts.fq_zero} 件`}
+                  hintColor="#0891b2"
                 />
 
                 <div
-                  style={{ height: 1, background: "#f1f5f9", margin: "0 24px" }}
+                  style={{
+                    height: 1,
+                    background: "#f1f5f9",
+                    margin: "0 24px",
+                  }}
                 />
 
-                {/* ② Fulfillment */}
+                {/* ② 訂單履行 */}
                 <KpiRow
                   title="訂單履行時效"
                   subtitle="漏寄、誤放、遺漏處理件數"
@@ -745,20 +774,27 @@ export default function App() {
                   maxScore={25}
                   value={fulfillmentErrors}
                   onChange={setFulfillmentErrors}
-                  rules={RULES.fulfillment}
+                  rules={STATIC_RULES.fulfillment}
                   openTooltip={openTooltip}
                   tooltipKey="fulfill"
                   onToggleTooltip={() =>
-                    setOpenTooltip(openTooltip === "fulfill" ? null : "fulfill")
+                    setOpenTooltip(
+                      openTooltip === "fulfill" ? null : "fulfill"
+                    )
                   }
                   hint="⚠ 1件即歸零"
+                  hintColor="#dc2626"
                 />
 
                 <div
-                  style={{ height: 1, background: "#f1f5f9", margin: "0 24px" }}
+                  style={{
+                    height: 1,
+                    background: "#f1f5f9",
+                    margin: "0 24px",
+                  }}
                 />
 
-                {/* ③ Inventory */}
+                {/* ③ 庫存管理 */}
                 <KpiRow
                   title="庫存管理穩定度"
                   subtitle="盤點帳貨差異件數"
@@ -767,13 +803,14 @@ export default function App() {
                   maxScore={20}
                   value={inventoryErrors}
                   onChange={setInventoryErrors}
-                  rules={RULES.inventory}
+                  rules={STATIC_RULES.inventory}
                   openTooltip={openTooltip}
                   tooltipKey="inv"
                   onToggleTooltip={() =>
                     setOpenTooltip(openTooltip === "inv" ? null : "inv")
                   }
                   hint="門檻制"
+                  hintColor="#dc2626"
                   extra={
                     <label
                       style={{
@@ -785,13 +822,14 @@ export default function App() {
                         fontSize: 12,
                         fontWeight: 600,
                         color: inventoryIncident ? "#dc2626" : "#94a3b8",
-                        transition: "color 0.2s",
                       }}
                     >
                       <input
                         type="checkbox"
                         checked={inventoryIncident}
-                        onChange={(e) => setInventoryIncident(e.target.checked)}
+                        onChange={(e) =>
+                          setInventoryIncident(e.target.checked)
+                        }
                         style={{
                           width: 16,
                           height: 16,
@@ -803,31 +841,10 @@ export default function App() {
                     </label>
                   }
                 />
-
-                <div
-                  style={{ height: 1, background: "#f1f5f9", margin: "0 24px" }}
-                />
-
-                {/* ④ Packaging */}
-                <KpiRow
-                  title="包裝責任客訴"
-                  subtitle="缺漏、貼錯標籤、備註未看"
-                  weight={20}
-                  score={results.scores.packageScore}
-                  maxScore={20}
-                  value={packagingErrors}
-                  onChange={setPackagingErrors}
-                  rules={RULES.packaging}
-                  openTooltip={openTooltip}
-                  tooltipKey="pkg"
-                  onToggleTooltip={() =>
-                    setOpenTooltip(openTooltip === "pkg" ? null : "pkg")
-                  }
-                />
               </div>
             </div>
 
-            {/* Staff Configuration */}
+            {/* Staff Config */}
             <div
               style={{
                 background: "#fff",
@@ -865,7 +882,11 @@ export default function App() {
                     部門人力配置與分配比例
                   </div>
                   <div
-                    style={{ fontSize: 12, color: "#94a3b8", fontWeight: 500 }}
+                    style={{
+                      fontSize: 12,
+                      color: "#94a3b8",
+                      fontWeight: 500,
+                    }}
                   >
                     選擇當前人數與分配規則
                   </div>
@@ -880,17 +901,12 @@ export default function App() {
                 }}
               >
                 {[
-                  {
-                    key: "2_even",
-                    name: "2 人平分",
-                    desc: "1 : 1",
-                    tag: "目前",
-                  },
+                  { key: "2_even", name: "2 人平分", desc: "1 : 1", tag: null },
                   {
                     key: "3_even",
                     name: "3 人平分",
                     desc: "1 : 1 : 1",
-                    tag: null,
+                    tag: "目前",
                   },
                   {
                     key: "3_weighted",
@@ -915,7 +931,6 @@ export default function App() {
                           ? "linear-gradient(135deg, #2563eb, #3b82f6)"
                           : "#fff",
                         color: active ? "#fff" : "#475569",
-                        transition: "all 0.2s",
                         position: "relative",
                         display: "flex",
                         flexDirection: "column",
@@ -944,7 +959,11 @@ export default function App() {
                         {opt.name}
                       </span>
                       <span
-                        style={{ fontSize: 11, opacity: 0.7, fontWeight: 500 }}
+                        style={{
+                          fontSize: 11,
+                          opacity: 0.7,
+                          fontWeight: 500,
+                        }}
                       >
                         比例 {opt.desc}
                       </span>
@@ -955,7 +974,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* ── RIGHT: Results ── */}
+          {/* RIGHT */}
           <div
             style={{
               display: "flex",
@@ -967,7 +986,9 @@ export default function App() {
             {/* Score Card */}
             <div
               style={{
-                background: results.isQualityMonth
+                background: results.isBelowThreshold
+                  ? "linear-gradient(145deg, #1f2937, #374151, #4b5563)"
+                  : results.isQualityMonth
                   ? "linear-gradient(145deg, #059669, #047857, #065f46)"
                   : results.finalScore >= 80
                   ? "linear-gradient(145deg, #1e40af, #2563eb, #1d4ed8)"
@@ -980,10 +1001,8 @@ export default function App() {
                 position: "relative",
                 overflow: "hidden",
                 boxShadow: "0 20px 40px rgba(0,0,0,0.15)",
-                transition: "background 0.5s",
               }}
             >
-              {/* Decorative circle */}
               <div
                 style={{
                   position: "absolute",
@@ -993,17 +1012,6 @@ export default function App() {
                   height: 160,
                   borderRadius: "50%",
                   background: "rgba(255,255,255,0.06)",
-                }}
-              />
-              <div
-                style={{
-                  position: "absolute",
-                  bottom: -20,
-                  left: -20,
-                  width: 100,
-                  height: 100,
-                  borderRadius: "50%",
-                  background: "rgba(255,255,255,0.04)",
                 }}
               />
 
@@ -1031,11 +1039,27 @@ export default function App() {
                       borderRadius: 8,
                       fontSize: 10,
                       fontWeight: 800,
-                      letterSpacing: "0.02em",
                       animation: "pulse 2s ease-in-out infinite",
                     }}
                   >
                     <Icons.crown /> 品質穩定月 ×1.2
+                  </div>
+                )}
+                {results.isBelowThreshold && (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                      background: "rgba(239, 68, 68, 0.9)",
+                      color: "#fff",
+                      padding: "4px 10px",
+                      borderRadius: 8,
+                      fontSize: 10,
+                      fontWeight: 800,
+                    }}
+                  >
+                    <Icons.ban /> 未達 {MIN_THRESHOLD_SCORE} 分門檻
                   </div>
                 )}
               </div>
@@ -1065,7 +1089,6 @@ export default function App() {
                 </span>
               </div>
 
-              {/* Progress bar */}
               <div
                 style={{
                   width: "100%",
@@ -1088,12 +1111,26 @@ export default function App() {
                         100,
                       100
                     )}%`,
-                    transition: "width 0.6s cubic-bezier(0.4, 0, 0.2, 1)",
+                    transition: "width 0.6s",
+                  }}
+                />
+                {/* 40 分門檻線 */}
+                <div
+                  style={{
+                    position: "absolute",
+                    top: -4,
+                    bottom: -4,
+                    left: `${
+                      (MIN_THRESHOLD_SCORE /
+                        (results.isQualityMonth ? 120 : 100)) *
+                      100
+                    }%`,
+                    width: 2,
+                    background: "rgba(255,255,255,0.6)",
                   }}
                 />
               </div>
 
-              {/* Bonus details */}
               <div
                 style={{
                   background: "rgba(255,255,255,0.1)",
@@ -1152,25 +1189,33 @@ export default function App() {
                   }}
                 >
                   <span>得分係數</span>
-                  <span>{(results.finalScore / 100).toFixed(2)}</span>
+                  <span>
+                    {results.isBelowThreshold
+                      ? "0.00（未達門檻）"
+                      : (results.finalScore / 100).toFixed(2)}
+                  </span>
                 </div>
-                {results.isQualityMonth && (
+                {results.isBelowThreshold && (
                   <div
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
                       fontSize: 12,
-                      opacity: 0.7,
+                      opacity: 0.9,
+                      color: "#fecaca",
+                      marginTop: 6,
+                      paddingTop: 6,
+                      borderTop: "1px dashed rgba(255,255,255,0.2)",
                     }}
                   >
-                    <span>加成前原始獎金</span>
-                    <span>${results.bonusPool.toLocaleString()}</span>
+                    <span>未達 {MIN_THRESHOLD_SCORE} 分門檻</span>
+                    <span>本月不發獎金</span>
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Distribution Card */}
+            {/* Distribution */}
             <div
               style={{
                 background: "#fff",
@@ -1205,9 +1250,10 @@ export default function App() {
               >
                 {results.staffDistribution.map((staff, idx) => {
                   const maxAmt = Math.max(
-                    ...results.staffDistribution.map((s) => s.amount)
+                    ...results.staffDistribution.map((s) => s.amount),
+                    1
                   );
-                  const barPct = maxAmt > 0 ? (staff.amount / maxAmt) * 100 : 0;
+                  const barPct = (staff.amount / maxAmt) * 100;
                   return (
                     <div
                       key={idx}
@@ -1220,7 +1266,6 @@ export default function App() {
                         overflow: "hidden",
                       }}
                     >
-                      {/* Background bar */}
                       <div
                         style={{
                           position: "absolute",
@@ -1230,7 +1275,6 @@ export default function App() {
                           width: `${barPct}%`,
                           background:
                             "linear-gradient(90deg, rgba(37,99,235,0.06), rgba(37,99,235,0.02))",
-                          transition: "width 0.5s ease-out",
                         }}
                       />
                       <div
@@ -1267,7 +1311,9 @@ export default function App() {
                           style={{
                             fontSize: 20,
                             fontWeight: 900,
-                            color: "#1e40af",
+                            color: results.isBelowThreshold
+                              ? "#94a3b8"
+                              : "#1e40af",
                             fontVariantNumeric: "tabular-nums",
                           }}
                         >
@@ -1280,14 +1326,13 @@ export default function App() {
               </div>
             </div>
 
-            {/* Status Alert */}
             <StatusAlert
               isQualityMonth={results.isQualityMonth}
+              isBelowThreshold={results.isBelowThreshold}
               finalScore={results.finalScore}
               rawScore={results.rawTotalScore}
             />
 
-            {/* Quick reference */}
             <div
               style={{
                 background: "#f8fafc",
@@ -1310,8 +1355,14 @@ export default function App() {
                 公式速查
               </div>
               <div>獎金池 = 月營收 × 0.1%</div>
+              <div>
+                出貨/包裝採比率制（基準 max(訂單量, 1000) 筆）
+              </div>
               <div>實際獎金 = 獎金池 × (KPI得分 ÷ 100)</div>
               <div>品質穩定月 = 全項目零錯誤 → 得分 ×1.2（上限120）</div>
+              <div style={{ color: "#dc2626", fontWeight: 600 }}>
+                總分 &lt; {MIN_THRESHOLD_SCORE} 分 → 獎金歸零
+              </div>
             </div>
           </div>
         </div>
@@ -1320,7 +1371,7 @@ export default function App() {
   );
 }
 
-// ── KPI Row Component ──
+// ── KPI Row ──
 function KpiRow({
   title,
   subtitle,
@@ -1334,6 +1385,7 @@ function KpiRow({
   tooltipKey,
   onToggleTooltip,
   hint,
+  hintColor,
   extra,
 }) {
   return (
@@ -1378,8 +1430,9 @@ function KpiRow({
                   fontWeight: 700,
                   padding: "3px 8px",
                   borderRadius: 6,
-                  background: "#fef2f2",
-                  color: "#dc2626",
+                  background:
+                    hintColor === "#dc2626" ? "#fef2f2" : "#ecfeff",
+                  color: hintColor,
                 }}
               >
                 {hint}
@@ -1412,8 +1465,47 @@ function KpiRow({
   );
 }
 
-// ── Status Alert Component ──
-function StatusAlert({ isQualityMonth, finalScore, rawScore }) {
+// ── Status Alert ──
+function StatusAlert({
+  isQualityMonth,
+  isBelowThreshold,
+  finalScore,
+  rawScore,
+}) {
+  if (isBelowThreshold) {
+    return (
+      <div
+        style={{
+          background: "linear-gradient(135deg, #f9fafb, #f3f4f6)",
+          border: "1px solid #d1d5db",
+          borderRadius: 16,
+          padding: "16px 20px",
+          display: "flex",
+          gap: 12,
+          alignItems: "flex-start",
+        }}
+      >
+        <div style={{ color: "#4b5563", marginTop: 2, flexShrink: 0 }}>
+          <Icons.ban />
+        </div>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 13, color: "#1f2937" }}>
+            未達獎金門檻
+          </div>
+          <div
+            style={{
+              fontSize: 12,
+              color: "#4b5563",
+              marginTop: 4,
+              lineHeight: 1.6,
+            }}
+          >
+            本月得分 {finalScore} 分，低於 {MIN_THRESHOLD_SCORE} 分標準，本月不發 KPI 獎金。建議召開檢討會議找出根因。
+          </div>
+        </div>
+      </div>
+    );
+  }
   if (isQualityMonth) {
     return (
       <div
@@ -1477,7 +1569,7 @@ function StatusAlert({ isQualityMonth, finalScore, rawScore }) {
               lineHeight: 1.6,
             }}
           >
-            得分偏低，獎金池縮減明顯，建議立即檢討錯誤環節。
+            得分接近 {MIN_THRESHOLD_SCORE} 分歸零門檻，建議立即檢討錯誤環節。
           </div>
         </div>
       </div>
