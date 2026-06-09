@@ -8,12 +8,12 @@ import React, {
 
 /* ─────────────────────────────────────────────
    BESTEA 出貨暨庫存管理 KPI 試算工具
-   v3.0 — 合併版
-   主要變更：
-   1. 新增「當月訂單量」欄位（最低基準 1,000 筆）
-   2. 合併「出貨正確率 + 包裝客訴」→「出貨包裝正確率」(55 分)
-   3. 出貨包裝採比率制 5 階梯（0% / 0.1% / 0.2% / 0.3% / ≥0.4%）
-   4. 總分 < 40 分 → 獎金歸零
+   v3.2 — 合併版
+   主要變更（相對 v3.0）：
+   1. 第一階梯懲罰調緩：48→52 / 36→42 / 22→28 / 10→14
+   2. 新增「出貨包裝硬性否決條款」：該項得 0 分（錯誤率 ≥0.5%）
+      → 整月獎金歸零，不受其他項目影響
+   3. 否決原因與「未達 40 分門檻」分開顯示
    ───────────────────────────────────────────── */
 
 // ── Icons (inline SVG) ──
@@ -59,13 +59,14 @@ const Icons = {
 
 // ── 比率制門檻（以每 1,000 筆為基準） ──
 // 合併「出貨正確率 + 包裝客訴」= 55 分（原 35 + 20）
+// v3.2：第一階梯懲罰調緩 → 48→52 / 36→42 / 22→28 / 10→14
 const RATE_THRESHOLDS = {
   fulfillmentQuality: [
     { maxRate: 0, score: 55, label: "0%（0 件）" },
-    { maxRate: 0.001, score: 48, label: "0.1%（1 件 / 1000）" },
-    { maxRate: 0.002, score: 36, label: "0.2%（2 件 / 1000）" },
-    { maxRate: 0.003, score: 22, label: "0.3%（3 件 / 1000）" },
-    { maxRate: 0.004, score: 10, label: "0.4%（4 件 / 1000）" },
+    { maxRate: 0.001, score: 52, label: "0.1%（1 件 / 1000）" },
+    { maxRate: 0.002, score: 42, label: "0.2%（2 件 / 1000）" },
+    { maxRate: 0.003, score: 28, label: "0.3%（3 件 / 1000）" },
+    { maxRate: 0.004, score: 14, label: "0.4%（4 件 / 1000）" },
     { maxRate: Infinity, score: 0, label: "≥0.5%（5 件 / 1000）" },
   ],
 };
@@ -86,10 +87,10 @@ function calculateThresholdCounts(orderCount) {
   const baseOrders = Math.max(orderCount, 1000);
   return {
     fq_full: 0,
-    fq_48: Math.floor(baseOrders * 0.001),
-    fq_36: Math.floor(baseOrders * 0.002),
-    fq_22: Math.floor(baseOrders * 0.003),
-    fq_10: Math.floor(baseOrders * 0.004),
+    fq_52: Math.floor(baseOrders * 0.001),
+    fq_42: Math.floor(baseOrders * 0.002),
+    fq_28: Math.floor(baseOrders * 0.003),
+    fq_14: Math.floor(baseOrders * 0.004),
     fq_zero: Math.floor(baseOrders * 0.004) + 1,
   };
 }
@@ -358,6 +359,9 @@ export default function App() {
     const rawTotalScore =
       fulfillmentQualityScore + fulfillmentScore + inventoryScore;
 
+    // 【v3.2】出貨包裝硬性否決：該項得 0 分（錯誤率 ≥0.5%）→ 整月獎金歸零
+    const isFulfillmentQualityFailed = fulfillmentQualityScore === 0;
+
     // 品質穩定月（全項目零錯誤）
     const isQualityMonth =
       fulfillmentQualityErrors === 0 &&
@@ -370,8 +374,9 @@ export default function App() {
       ? Math.min(rawTotalScore * 1.2, 120)
       : rawTotalScore;
 
-    // < 40 分 → 獎金歸零
-    const isBelowThreshold = finalScore < MIN_THRESHOLD_SCORE;
+    // < 40 分 或 出貨包裝否決 → 獎金歸零
+    const isBelowThreshold =
+      finalScore < MIN_THRESHOLD_SCORE || isFulfillmentQualityFailed;
 
     const bonusPool = Math.round(revenue * 0.001);
 
@@ -427,6 +432,7 @@ export default function App() {
       finalScore,
       isQualityMonth,
       isBelowThreshold,
+      isFulfillmentQualityFailed,
       bonusPool,
       actualTotalBonus,
       staffDistribution,
@@ -497,7 +503,7 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
-              <Icons.package /> BESTEA 內部管理 ・ v3.1
+              <Icons.package /> BESTEA 內部管理 ・ v3.2
             </div>
             <h1
               style={{
@@ -742,9 +748,9 @@ export default function App() {
                     color:
                       r.score === 55
                         ? "#22c55e"
-                        : r.score >= 36
+                        : r.score >= 42
                         ? "#eab308"
-                        : r.score >= 10
+                        : r.score >= 14
                         ? "#f97316"
                         : "#ef4444",
                   }))}
@@ -753,8 +759,8 @@ export default function App() {
                   onToggleTooltip={() =>
                     setOpenTooltip(openTooltip === "fq" ? null : "fq")
                   }
-                  hint={`歸零 ≥${thresholdCounts.fq_zero} 件`}
-                  hintColor="#0891b2"
+                  hint={`⚠ 否決 ≥${thresholdCounts.fq_zero} 件`}
+                  hintColor="#dc2626"
                 />
 
                 <div
@@ -1059,7 +1065,10 @@ export default function App() {
                       fontWeight: 800,
                     }}
                   >
-                    <Icons.ban /> 未達 {MIN_THRESHOLD_SCORE} 分門檻
+                    <Icons.ban />{" "}
+                    {results.isFulfillmentQualityFailed
+                      ? "出貨包裝否決"
+                      : `未達 ${MIN_THRESHOLD_SCORE} 分門檻`}
                   </div>
                 )}
               </div>
@@ -1208,7 +1217,11 @@ export default function App() {
                       borderTop: "1px dashed rgba(255,255,255,0.2)",
                     }}
                   >
-                    <span>未達 {MIN_THRESHOLD_SCORE} 分門檻</span>
+                    <span>
+                      {results.isFulfillmentQualityFailed
+                        ? "出貨包裝正確率不及格"
+                        : `未達 ${MIN_THRESHOLD_SCORE} 分門檻`}
+                    </span>
                     <span>本月不發獎金</span>
                   </div>
                 )}
@@ -1329,6 +1342,7 @@ export default function App() {
             <StatusAlert
               isQualityMonth={results.isQualityMonth}
               isBelowThreshold={results.isBelowThreshold}
+              isFulfillmentQualityFailed={results.isFulfillmentQualityFailed}
               finalScore={results.finalScore}
               rawScore={results.rawTotalScore}
             />
@@ -1362,6 +1376,9 @@ export default function App() {
               <div>品質穩定月 = 全項目零錯誤 → 得分 ×1.2（上限120）</div>
               <div style={{ color: "#dc2626", fontWeight: 600 }}>
                 總分 &lt; {MIN_THRESHOLD_SCORE} 分 → 獎金歸零
+              </div>
+              <div style={{ color: "#dc2626", fontWeight: 600 }}>
+                出貨包裝得 0 分（≥0.5%）→ 整月否決，不發獎金
               </div>
             </div>
           </div>
@@ -1469,6 +1486,7 @@ function KpiRow({
 function StatusAlert({
   isQualityMonth,
   isBelowThreshold,
+  isFulfillmentQualityFailed,
   finalScore,
   rawScore,
 }) {
@@ -1490,7 +1508,9 @@ function StatusAlert({
         </div>
         <div>
           <div style={{ fontWeight: 700, fontSize: 13, color: "#1f2937" }}>
-            未達獎金門檻
+            {isFulfillmentQualityFailed
+              ? "出貨包裝否決：本月不發獎金"
+              : "未達獎金門檻"}
           </div>
           <div
             style={{
@@ -1500,7 +1520,9 @@ function StatusAlert({
               lineHeight: 1.6,
             }}
           >
-            本月得分 {finalScore} 分，低於 {MIN_THRESHOLD_SCORE} 分標準，本月不發 KPI 獎金。建議召開檢討會議找出根因。
+            {isFulfillmentQualityFailed
+              ? `出貨包裝正確率錯誤率達 ≥0.5%（核心職責不及格），依否決條款本月不發 KPI 獎金，無論其他項目得分。建議立即召開檢討會議找出根因。`
+              : `本月得分 ${finalScore} 分，低於 ${MIN_THRESHOLD_SCORE} 分標準，本月不發 KPI 獎金。建議召開檢討會議找出根因。`}
           </div>
         </div>
       </div>
