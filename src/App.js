@@ -1,4 +1,17 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { initializeApp, getApps, getApp } from "firebase/app";
+import {
+  getAuth,
+  onAuthStateChanged,
+  signInAnonymously,
+} from "firebase/auth";
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  setDoc,
+  onSnapshot,
+} from "firebase/firestore";
 
 /* ─────────────────────────────────────────────
    BESTEA 出貨暨庫存管理 KPI 試算工具
@@ -25,6 +38,13 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
      （600 單時行為與 v3.4 完全相同：1件=10、2件歸零、3件否決；
        單量成長後容錯件數等比放大，如 2000 單 → 3件歸零、5件否決）
    - 庫存管理穩定度維持固定件數硬門檻不變
+
+   v4.1 — Firebase 雲端同步：
+   - 資料改存 Firestore（warrooms/bestea_kpi_v1，與利潤決策中心同專案、
+     匿名登入），多台電腦/瀏覽器即時共用，clearing 瀏覽器資料不再滅資料
+   - localStorage 降為本機快取＋離線備援；首次連線會把既有本機資料
+     自動搬上雲端；雲端已有資料時以雲端為準
+   - 標頭顯示同步狀態：連線中／儲存中／已同步雲端／離線僅存本機
 
    v4.0 — 錯誤登記表 + 月份歷史：
    - 錯誤登記表：日期/分類/錯誤類型/訂單編號/發現方式，發生當下記一筆；
@@ -383,6 +403,17 @@ const ScoreBadge = ({ score, max }) => {
   );
 };
 
+/* ── Firebase（與利潤決策中心同一專案） ── */
+const FBC = {
+  apiKey: "AIzaSyBGWCKe1mw87g_KRtt-Ar3ffeAExOoYJrg",
+  authDomain: "enterprise-e7704.firebaseapp.com",
+  projectId: "enterprise-e7704",
+  storageBucket: "enterprise-e7704.firebasestorage.app",
+  messagingSenderId: "435446255525",
+  appId: "1:435446255525:web:7f1727440a507d7add224c",
+};
+const FS_KPI = { collection: "warrooms", docId: "bestea_kpi_v1" };
+
 const STORAGE_KEY = "bestea-kpi-data-v3";
 const LEGACY_STORAGE_KEY = "bestea-kpi-data-v2";
 const MIN_THRESHOLD_SCORE = 40; // 低於此分數獎金歸零
@@ -641,8 +672,15 @@ export default function App() {
   const [logs, setLogs] = useState(initMd.logs || []);
   const [autoFromLog, setAutoFromLog] = useState(initMd.autoFromLog ?? true);
   const [openTooltip, setOpenTooltip] = useState(null);
-  const [showSaved, setShowSaved] = useState(false);
-  const firstRun = useRef(true);
+  // 雲端同步狀態：connecting / saving / synced / offline
+  const [syncStatus, setSyncStatus] = useState("connecting");
+  const monthsDataRef = useRef(init.months);
+  const monthRef = useRef(init.currentMonth);
+  const snapshotRef = useRef(null);
+  const fbDocRef = useRef(null);
+  const readyRef = useRef(false); // 雲端初始載入完成後才允許上傳
+  const applyingRemoteRef = useRef(false); // 正在套用遠端資料，跳過一次回寫
+  const writeTimer = useRef(null);
 
   // 登記表輸入表單
   const [logDate, setLogDate] = useState(todayStr());
@@ -651,6 +689,22 @@ export default function App() {
   const [logOrderNo, setLogOrderNo] = useState("");
   const [logSource, setLogSource] = useState(DISCOVERY_SOURCES[0]);
 
+  // 雲端寫入（去抖動 600ms）
+  const scheduleCloudWrite = (store) => {
+    if (!readyRef.current || !fbDocRef.current) return;
+    setSyncStatus("saving");
+    if (writeTimer.current) clearTimeout(writeTimer.current);
+    writeTimer.current = setTimeout(() => {
+      setDoc(fbDocRef.current, store)
+        .then(() => setSyncStatus("synced"))
+        .catch((e) => {
+          console.error("[KPI 雲端儲存失敗]", e);
+          setSyncStatus("offline");
+        });
+    }, 600);
+  };
+
+  // 任何變更 → 寫進當月快照 → 本機快取 + 雲端
   useEffect(() => {
     const snapshot = {
       revenue,
@@ -664,19 +718,18 @@ export default function App() {
       logs,
       autoFromLog,
     };
-    setMonthsData((prev) => {
-      const next = { ...prev, [month]: snapshot };
-      saveStore({ currentMonth: month, months: next });
-      return next;
-    });
-    // 初次載入不顯示「已自動儲存」
-    if (firstRun.current) {
-      firstRun.current = false;
-      return;
+    snapshotRef.current = snapshot;
+    monthRef.current = month;
+    const next = { ...monthsDataRef.current, [month]: snapshot };
+    monthsDataRef.current = next;
+    setMonthsData(next);
+    const store = { currentMonth: month, months: next };
+    saveStore(store); // 本機快取（離線備援）
+    if (applyingRemoteRef.current) {
+      applyingRemoteRef.current = false; // 剛套用遠端資料，不回寫
+    } else {
+      scheduleCloudWrite(store);
     }
-    setShowSaved(true);
-    const t = setTimeout(() => setShowSaved(false), 1500);
-    return () => clearTimeout(t);
   }, [
     month,
     revenue,
@@ -690,6 +743,90 @@ export default function App() {
     logs,
     autoFromLog,
   ]);
+
+  // ── Firebase 連線、初始載入、遠端監聽 ──
+  useEffect(() => {
+    let unsub = null;
+    let unsubAuth = null;
+    try {
+      const app = getApps().length ? getApp() : initializeApp(FBC);
+      const auth = getAuth(app);
+      const db = getFirestore(app);
+      fbDocRef.current = doc(db, FS_KPI.collection, FS_KPI.docId);
+
+      const applyStoreData = (store) => {
+        const m =
+          store.currentMonth && store.months[store.currentMonth]
+            ? store.currentMonth
+            : currentMonthStr();
+        const md = store.months[m] || defaultMonthData();
+        monthsDataRef.current = store.months || {};
+        setMonthsData(monthsDataRef.current);
+        applyingRemoteRef.current = true;
+        loadMonthData(md);
+        setMonth(m);
+        monthRef.current = m;
+      };
+
+      unsubAuth = onAuthStateChanged(auth, async (u) => {
+        try {
+          if (!u) {
+            await signInAnonymously(auth);
+            return;
+          }
+          // 登入完成 → 讀雲端
+          const snap = await getDoc(fbDocRef.current);
+          if (snap.exists() && snap.data()?.months) {
+            // 雲端已有資料 → 以雲端為準
+            applyStoreData(snap.data());
+          } else {
+            // 雲端沒資料 → 把本機既有資料搬上雲端
+            const local = loadStore();
+            await setDoc(fbDocRef.current, local);
+          }
+          readyRef.current = true;
+          setSyncStatus("synced");
+
+          // 監聽其他裝置的變更
+          unsub = onSnapshot(fbDocRef.current, (s) => {
+            if (s.metadata.hasPendingWrites) return; // 自己寫入的回音
+            const remote = s.data();
+            if (!remote || !remote.months) return;
+            const merged = {
+              ...remote.months,
+              [monthRef.current]:
+                remote.months[monthRef.current] ||
+                monthsDataRef.current[monthRef.current],
+            };
+            monthsDataRef.current = merged;
+            setMonthsData(merged);
+            const rCur = remote.months[monthRef.current];
+            if (
+              rCur &&
+              JSON.stringify(rCur) !== JSON.stringify(snapshotRef.current)
+            ) {
+              applyingRemoteRef.current = true;
+              loadMonthData(rCur);
+            }
+          });
+        } catch (e) {
+          console.error("[KPI Firebase 讀取失敗]", e);
+          readyRef.current = true; // 離線也允許繼續用本機
+          setSyncStatus("offline");
+        }
+      });
+    } catch (e) {
+      console.error("[KPI Firebase 初始化失敗]", e);
+      readyRef.current = true;
+      setSyncStatus("offline");
+    }
+    return () => {
+      if (unsub) unsub();
+      if (unsubAuth) unsubAuth();
+      if (writeTimer.current) clearTimeout(writeTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── 月份切換 ──
   const loadMonthData = (md) => {
@@ -726,12 +863,13 @@ export default function App() {
   const deleteMonth = (m) => {
     if (m === month) return;
     if (!window.confirm(`確定刪除 ${monthLabel(m)} 的整月紀錄？`)) return;
-    setMonthsData((prev) => {
-      const next = { ...prev };
-      delete next[m];
-      saveStore({ currentMonth: month, months: next });
-      return next;
-    });
+    const next = { ...monthsDataRef.current };
+    delete next[m];
+    monthsDataRef.current = next;
+    setMonthsData(next);
+    const store = { currentMonth: month, months: next };
+    saveStore(store);
+    scheduleCloudWrite(store);
   };
 
   const handleReset = () => {
@@ -970,7 +1108,7 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
-              <Icons.package /> BESTEA 內部管理 ・ v4.0
+              <Icons.package /> BESTEA 內部管理 ・ v4.1
             </div>
             <h1
               style={{
@@ -997,21 +1135,37 @@ export default function App() {
               }}
             >
               比率制 ・ 最低基準 1,000 筆 ・ 總分 {MIN_THRESHOLD_SCORE} 分為獎金門檻
-              {showSaved && (
-                <span
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 700,
-                    color: "#22c55e",
-                    background: "#f0fdf4",
-                    padding: "2px 8px",
-                    borderRadius: 6,
-                    animation: "fadeIn 0.2s ease-out",
-                  }}
-                >
-                  ✓ 已自動儲存
-                </span>
-              )}
+              {(() => {
+                const map = {
+                  connecting: {
+                    t: "☁ 雲端連線中…",
+                    bg: "#f1f5f9",
+                    fg: "#64748b",
+                  },
+                  saving: { t: "☁ 儲存中…", bg: "#fef9c3", fg: "#a16207" },
+                  synced: { t: "☁ 已同步雲端", bg: "#f0fdf4", fg: "#16a34a" },
+                  offline: {
+                    t: "⚠ 離線・僅存本機",
+                    bg: "#fef2f2",
+                    fg: "#dc2626",
+                  },
+                };
+                const sy = map[syncStatus] || map.connecting;
+                return (
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: sy.fg,
+                      background: sy.bg,
+                      padding: "2px 8px",
+                      borderRadius: 6,
+                    }}
+                  >
+                    {sy.t}
+                  </span>
+                );
+              })()}
             </p>
             <div
               style={{
