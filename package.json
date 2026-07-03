@@ -11,6 +11,7 @@
     "react-scripts": "^5.0.0"
   },
   "devDependencies": {
+    "firebase": "^10.12.0",
     "@types/react": "19.0.0",
     "@types/react-dom": "19.0.0",
     "loader-utils": "3.2.1",
