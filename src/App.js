@@ -1,10 +1,4 @@
-import React, {
-  useState,
-  useMemo,
-  useRef,
-  useEffect,
-  useCallback,
-} from "react";
+import React, { useState, useMemo, useRef, useEffect } from "react";
 
 /* ─────────────────────────────────────────────
    BESTEA 出貨暨庫存管理 KPI 試算工具
@@ -31,6 +25,21 @@ import React, {
      （600 單時行為與 v3.4 完全相同：1件=10、2件歸零、3件否決；
        單量成長後容錯件數等比放大，如 2000 單 → 3件歸零、5件否決）
    - 庫存管理穩定度維持固定件數硬門檻不變
+
+   v4.0 — 錯誤登記表 + 月份歷史：
+   - 錯誤登記表：日期/分類/錯誤類型/訂單編號/發現方式，發生當下記一筆；
+     「登記表自動」模式下三大項件數＝登記表加總，
+     「手動試算」模式維持原步進器（供模擬）
+   - 月份切換：資料按月獨立保存（localStorage v3，自動遷移 v2 舊資料），
+     新月份自動沿用上月營收/設定、錯誤歸零
+   - 歷史與趨勢：逐月分數長條圖＋明細表（件數/得分/獎金/狀態），
+     近 3 月平均分與平均獎金；可開啟/刪除任一歷史月份
+
+   v3.6 — 參數開放版：
+   - 獎金池比例可調：預設 0.1%，附 0.1/0.2/0.3 快速鍵，可自由輸入
+   - 人力配置完全自訂：人數（1–8）、姓名、權重皆可編輯，
+     附 2人平分/3人平分/3人加權 快速範本；分帳仍走精確分帳
+   - 舊存檔的 staffMode 自動遷移為自訂名單
 
    v3.4.1 內容補充（計分數字不變）：
    - 三大項「計分範圍」補齊漏列樣態：
@@ -153,6 +162,30 @@ function splitByWeights(total, weights) {
     remainder -= 1;
   }
   return base;
+}
+
+// ── 人力配置快速範本 ──
+const STAFF_PRESETS = {
+  "2_even": [
+    { name: "員工 A", weight: 1 },
+    { name: "員工 B", weight: 1 },
+  ],
+  "3_even": [
+    { name: "員工 A", weight: 1 },
+    { name: "員工 B", weight: 1 },
+    { name: "員工 C", weight: 1 },
+  ],
+  "3_weighted": [
+    { name: "資深人員 A", weight: 2 },
+    { name: "資深人員 B", weight: 2 },
+    { name: "新進人員 C", weight: 1 },
+  ],
+};
+
+// 舊版存檔的 staffMode 遷移為自訂名單
+function migrateStaffMode(mode) {
+  const preset = STAFF_PRESETS[mode];
+  return preset ? preset.map((p) => ({ ...p })) : null;
 }
 
 // ── Tooltip 規則組 ──
@@ -350,60 +383,292 @@ const ScoreBadge = ({ score, max }) => {
   );
 };
 
-const STORAGE_KEY = "bestea-kpi-data-v2";
+const STORAGE_KEY = "bestea-kpi-data-v3";
+const LEGACY_STORAGE_KEY = "bestea-kpi-data-v2";
 const MIN_THRESHOLD_SCORE = 40; // 低於此分數獎金歸零
 
-function loadSaved() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+// ── 錯誤登記表：分類 / 類型 / 發現方式 ──
+const ERROR_CATEGORIES = [
+  { key: "fq", label: "① 出貨包裝", color: "#2563eb" },
+  { key: "fulfill", label: "② 訂單履行", color: "#d97706" },
+  { key: "inv", label: "③ 庫存管理", color: "#059669" },
+];
+
+const ERROR_TYPES = {
+  fq: [
+    "裝錯商品",
+    "少裝",
+    "多裝",
+    "貼錯標籤",
+    "缺漏配件",
+    "備註未看",
+    "贈品/加購品漏放",
+    "發票明細錯誤",
+    "禮盒提袋卡片漏附",
+    "包裝不良致運送毀損",
+    "效期批號錯誤",
+  ],
+  fulfill: [
+    "漏寄（收單未出貨）",
+    "逾時出貨",
+    "誤放",
+    "遺漏處理",
+    "物流單號未回填",
+    "補寄/換貨逾時",
+    "平台逾期出貨",
+  ],
+  inv: ["盤點帳貨差異", "入庫驗收未核對", "效期疏失（未先進先出）"],
+};
+
+const DISCOVERY_SOURCES = [
+  "客訴",
+  "自檢/互檢",
+  "盤點發現",
+  "平台通知",
+  "物流回報",
+  "其他",
+];
+
+// ── 日期輔助 ──
+function currentMonthStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
-function saveToDisk(data) {
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function monthLabel(m) {
+  const [y, mm] = m.split("-");
+  return `${y}年${Number(mm)}月`;
+}
+
+// ── 月份資料 ──
+function defaultMonthData(seed) {
+  return {
+    revenue: seed?.revenue ?? 1940000,
+    orderCount: seed?.orderCount ?? 600,
+    bonusRate: seed?.bonusRate ?? 0.1,
+    staffList: seed?.staffList
+      ? seed.staffList.map((p) => ({ ...p }))
+      : STAFF_PRESETS["3_even"].map((p) => ({ ...p })),
+    fulfillmentQualityErrors: 0,
+    fulfillmentErrors: 0,
+    inventoryErrors: 0,
+    inventoryIncident: false,
+    logs: [],
+    autoFromLog: true,
+  };
+}
+
+function loadStore() {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.months && parsed.currentMonth) return parsed;
+    }
+    // v2 → v3 遷移：舊的單月資料掛到當前月份
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (legacy) {
+      const old = JSON.parse(legacy);
+      const m = currentMonthStr();
+      return {
+        currentMonth: m,
+        months: {
+          [m]: {
+            ...defaultMonthData(),
+            ...old,
+            staffList:
+              Array.isArray(old.staffList) && old.staffList.length > 0
+                ? old.staffList
+                : migrateStaffMode(old.staffMode) ||
+                  STAFF_PRESETS["3_even"].map((p) => ({ ...p })),
+            logs: [],
+            autoFromLog: false, // 舊資料是手動輸入的件數
+          },
+        },
+      };
+    }
   } catch {}
+  return { currentMonth: currentMonthStr(), months: {} };
+}
+
+function saveStore(store) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  } catch {}
+}
+
+// ── 登記表加總 / 有效件數 ──
+function tallyLogs(logs) {
+  const t = { fq: 0, fulfill: 0, inv: 0 };
+  (logs || []).forEach((l) => {
+    if (t[l.category] != null) t[l.category] += 1;
+  });
+  return t;
+}
+
+function effectiveCounts(md) {
+  if (md.autoFromLog) return tallyLogs(md.logs);
+  return {
+    fq: md.fulfillmentQualityErrors || 0,
+    fulfill: md.fulfillmentErrors || 0,
+    inv: md.inventoryErrors || 0,
+  };
+}
+
+// ── 計分核心（純函式，當月與歷史共用） ──
+function computeKpi({ revenue, orderCount, bonusRate, counts, invIncident }) {
+  const fulfillmentQualityScore = scoreByRate(
+    counts.fq,
+    orderCount,
+    RATE_THRESHOLDS.fulfillmentQuality
+  );
+  const fulfillmentScore = scoreByRate(
+    counts.fulfill,
+    orderCount,
+    RATE_THRESHOLDS.fulfillment
+  );
+  const inventoryScore = invIncident
+    ? 0
+    : scoreByCount(counts.inv, INVENTORY_TIERS);
+
+  const rawTotalScore =
+    fulfillmentQualityScore + fulfillmentScore + inventoryScore;
+
+  const isFulfillmentQualityFailed = fulfillmentQualityScore === 0;
+  const isFulfillmentVetoed =
+    counts.fulfill / Math.max(orderCount, 1000) > FULFILLMENT_VETO_RATE;
+  const vetoReason = isFulfillmentQualityFailed
+    ? "fq"
+    : isFulfillmentVetoed
+    ? "fulfill"
+    : null;
+
+  const isQualityMonth =
+    counts.fq === 0 && counts.fulfill === 0 && counts.inv === 0 && !invIncident;
+
+  const finalScore = isQualityMonth
+    ? Math.min(rawTotalScore * 1.2, 120)
+    : rawTotalScore;
+
+  const isBelowThreshold =
+    finalScore < MIN_THRESHOLD_SCORE || vetoReason !== null;
+
+  const bonusPool = Math.round(revenue * (bonusRate / 100));
+  const actualTotalBonus = isBelowThreshold
+    ? 0
+    : Math.round(bonusPool * (finalScore / 100));
+
+  return {
+    scores: { fulfillmentQualityScore, fulfillmentScore, inventoryScore },
+    rawTotalScore,
+    finalScore,
+    isQualityMonth,
+    isBelowThreshold,
+    vetoReason,
+    bonusPool,
+    actualTotalBonus,
+  };
+}
+
+function computeMonth(md) {
+  return computeKpi({
+    revenue: md.revenue,
+    orderCount: md.orderCount,
+    bonusRate: md.bonusRate,
+    counts: effectiveCounts(md),
+    invIncident: md.inventoryIncident,
+  });
+}
+
+// ── 歷史顯示輔助 ──
+function barColor(kpi) {
+  if (kpi.isBelowThreshold) return "#9ca3af";
+  if (kpi.isQualityMonth) return "#10b981";
+  if (kpi.finalScore >= 80) return "#3b82f6";
+  if (kpi.finalScore >= 60) return "#f59e0b";
+  return "#ef4444";
+}
+
+function statusText(kpi) {
+  if (kpi.vetoReason === "fq") return "包裝否決";
+  if (kpi.vetoReason === "fulfill") return "漏寄否決";
+  if (kpi.isBelowThreshold) return "未達門檻";
+  if (kpi.isQualityMonth) return "品質穩定月";
+  return "正常";
+}
+
+function statusStyle(kpi) {
+  if (kpi.isBelowThreshold) return { background: "#f3f4f6", color: "#6b7280" };
+  if (kpi.isQualityMonth) return { background: "#d1fae5", color: "#065f46" };
+  return { background: "#dbeafe", color: "#1e40af" };
 }
 
 // ── Main App ──
 export default function App() {
-  const saved = useRef(loadSaved());
-  const s = saved.current;
+  const initialStore = useRef(loadStore());
+  const init = initialStore.current;
+  const initMd = init.months[init.currentMonth] || defaultMonthData();
 
-  const [revenue, setRevenue] = useState(s?.revenue ?? 1940000);
-  const [orderCount, setOrderCount] = useState(s?.orderCount ?? 600);
-  const [staffMode, setStaffMode] = useState(s?.staffMode ?? "3_even");
+  const [month, setMonth] = useState(init.currentMonth);
+  const [monthsData, setMonthsData] = useState(init.months);
+  const [revenue, setRevenue] = useState(initMd.revenue);
+  const [orderCount, setOrderCount] = useState(initMd.orderCount);
+  // 獎金池比例（百分比值：0.1 = 0.1%）
+  const [bonusRate, setBonusRate] = useState(initMd.bonusRate);
+  const [staffList, setStaffList] = useState(
+    initMd.staffList.map((p) => ({ ...p }))
+  );
   const [fulfillmentQualityErrors, setFulfillmentQualityErrors] = useState(
-    s?.fulfillmentQualityErrors ?? 0
+    initMd.fulfillmentQualityErrors
   );
   const [fulfillmentErrors, setFulfillmentErrors] = useState(
-    s?.fulfillmentErrors ?? 0
+    initMd.fulfillmentErrors
   );
   const [inventoryErrors, setInventoryErrors] = useState(
-    s?.inventoryErrors ?? 0
+    initMd.inventoryErrors
   );
   const [inventoryIncident, setInventoryIncident] = useState(
-    s?.inventoryIncident ?? false
+    initMd.inventoryIncident
   );
+  const [logs, setLogs] = useState(initMd.logs || []);
+  const [autoFromLog, setAutoFromLog] = useState(initMd.autoFromLog ?? true);
   const [openTooltip, setOpenTooltip] = useState(null);
   const [showSaved, setShowSaved] = useState(false);
   const firstRun = useRef(true);
 
+  // 登記表輸入表單
+  const [logDate, setLogDate] = useState(todayStr());
+  const [logCategory, setLogCategory] = useState("fq");
+  const [logType, setLogType] = useState(ERROR_TYPES.fq[0]);
+  const [logOrderNo, setLogOrderNo] = useState("");
+  const [logSource, setLogSource] = useState(DISCOVERY_SOURCES[0]);
+
   useEffect(() => {
-    const data = {
+    const snapshot = {
       revenue,
       orderCount,
-      staffMode,
+      bonusRate,
+      staffList,
       fulfillmentQualityErrors,
       fulfillmentErrors,
       inventoryErrors,
       inventoryIncident,
+      logs,
+      autoFromLog,
     };
-    saveToDisk(data);
+    setMonthsData((prev) => {
+      const next = { ...prev, [month]: snapshot };
+      saveStore({ currentMonth: month, months: next });
+      return next;
+    });
     // 初次載入不顯示「已自動儲存」
     if (firstRun.current) {
       firstRun.current = false;
@@ -413,26 +678,92 @@ export default function App() {
     const t = setTimeout(() => setShowSaved(false), 1500);
     return () => clearTimeout(t);
   }, [
+    month,
     revenue,
     orderCount,
-    staffMode,
+    bonusRate,
+    staffList,
     fulfillmentQualityErrors,
     fulfillmentErrors,
     inventoryErrors,
     inventoryIncident,
+    logs,
+    autoFromLog,
   ]);
 
-  const handleReset = useCallback(() => {
-    if (!window.confirm("確定要清除所有數據，恢復預設值嗎？")) return;
-    setRevenue(1940000);
-    setOrderCount(600);
-    setStaffMode("3_even");
-    setFulfillmentQualityErrors(0);
-    setFulfillmentErrors(0);
-    setInventoryErrors(0);
-    setInventoryIncident(false);
-    localStorage.removeItem(STORAGE_KEY);
-  }, []);
+  // ── 月份切換 ──
+  const loadMonthData = (md) => {
+    setRevenue(md.revenue);
+    setOrderCount(md.orderCount);
+    setBonusRate(md.bonusRate);
+    setStaffList(md.staffList.map((p) => ({ ...p })));
+    setFulfillmentQualityErrors(md.fulfillmentQualityErrors);
+    setFulfillmentErrors(md.fulfillmentErrors);
+    setInventoryErrors(md.inventoryErrors);
+    setInventoryIncident(md.inventoryIncident);
+    setLogs(md.logs || []);
+    setAutoFromLog(md.autoFromLog ?? true);
+  };
+
+  const switchMonth = (m) => {
+    if (!m || m === month) return;
+    // 當月資料已由自動儲存寫入 monthsData；新月份沿用當月設定、錯誤歸零
+    const target =
+      monthsData[m] ||
+      defaultMonthData({ revenue, orderCount, bonusRate, staffList });
+    loadMonthData(target);
+    setMonth(m);
+  };
+
+  const shiftMonth = (delta) => {
+    const [y, mm] = month.split("-").map(Number);
+    const d = new Date(y, mm - 1 + delta, 1);
+    switchMonth(
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`
+    );
+  };
+
+  const deleteMonth = (m) => {
+    if (m === month) return;
+    if (!window.confirm(`確定刪除 ${monthLabel(m)} 的整月紀錄？`)) return;
+    setMonthsData((prev) => {
+      const next = { ...prev };
+      delete next[m];
+      saveStore({ currentMonth: month, months: next });
+      return next;
+    });
+  };
+
+  const handleReset = () => {
+    if (
+      !window.confirm(
+        `確定要清除 ${monthLabel(month)} 的數據嗎？（其他月份不受影響）`
+      )
+    )
+      return;
+    loadMonthData(defaultMonthData());
+  };
+
+  // ── 登記表操作 ──
+  const addLog = () => {
+    setLogs((l) => [
+      {
+        id: Date.now(),
+        date: logDate || todayStr(),
+        category: logCategory,
+        type: logType,
+        orderNo: logOrderNo.trim(),
+        source: logSource,
+      },
+      ...l,
+    ]);
+    setLogOrderNo("");
+  };
+  const removeLog = (id) => setLogs((l) => l.filter((e) => e.id !== id));
+  const changeLogCategory = (c) => {
+    setLogCategory(c);
+    setLogType(ERROR_TYPES[c][0]);
+  };
 
   const fqVetoCount = useMemo(
     () => countToExceedRate(orderCount, 0.004),
@@ -447,121 +778,137 @@ export default function App() {
     [orderCount]
   );
 
-  const results = useMemo(() => {
-    // ① 出貨包裝正確率（55分）— 比率制（合併出貨+包裝）
-    const fulfillmentQualityScore = scoreByRate(
+  // 計分件數來源：登記表自動加總 or 手動輸入
+  const logTally = useMemo(() => tallyLogs(logs), [logs]);
+  const effCounts = useMemo(
+    () =>
+      autoFromLog
+        ? logTally
+        : {
+            fq: fulfillmentQualityErrors,
+            fulfill: fulfillmentErrors,
+            inv: inventoryErrors,
+          },
+    [
+      autoFromLog,
+      logTally,
       fulfillmentQualityErrors,
-      orderCount,
-      RATE_THRESHOLDS.fulfillmentQuality
-    );
-
-    // ② 訂單履行時效（25分）— v3.5 比率制（隨單量放大）
-    const fulfillmentScore = scoreByRate(
       fulfillmentErrors,
+      inventoryErrors,
+    ]
+  );
+
+  const results = useMemo(() => {
+    const kpi = computeKpi({
+      revenue,
       orderCount,
-      RATE_THRESHOLDS.fulfillment
-    );
-
-    // ③ 庫存管理穩定度（20分）— v3.3 階梯制 + 事故條款
-    const inventoryScore = inventoryIncident
-      ? 0
-      : scoreByCount(inventoryErrors, INVENTORY_TIERS);
-
-    const rawTotalScore =
-      fulfillmentQualityScore + fulfillmentScore + inventoryScore;
-
-    // 出貨包裝硬性否決：該項得 0 分（錯誤率 ≥0.5%）→ 整月獎金歸零
-    const isFulfillmentQualityFailed = fulfillmentQualityScore === 0;
-
-    // 漏寄硬性否決：漏寄率 >0.2% → 整月獎金歸零
-    const isFulfillmentVetoed =
-      fulfillmentErrors / Math.max(orderCount, 1000) > FULFILLMENT_VETO_RATE;
-
-    // 否決原因（fq = 出貨包裝、fulfill = 漏寄）
-    const vetoReason = isFulfillmentQualityFailed
-      ? "fq"
-      : isFulfillmentVetoed
-      ? "fulfill"
-      : null;
-
-    // 品質穩定月（全項目零錯誤）
-    const isQualityMonth =
-      fulfillmentQualityErrors === 0 &&
-      fulfillmentErrors === 0 &&
-      inventoryErrors === 0 &&
-      !inventoryIncident;
-
-    // 加成後分數（上限 120）
-    const finalScore = isQualityMonth
-      ? Math.min(rawTotalScore * 1.2, 120)
-      : rawTotalScore;
-
-    // < 40 分 或 觸發任一否決條款 → 獎金歸零
-    const isBelowThreshold =
-      finalScore < MIN_THRESHOLD_SCORE || vetoReason !== null;
-
-    const bonusPool = Math.round(revenue * 0.001);
-
-    const actualTotalBonus = isBelowThreshold
-      ? 0
-      : Math.round(bonusPool * (finalScore / 100));
+      bonusRate,
+      counts: effCounts,
+      invIncident: inventoryIncident,
+    });
 
     // 精確分帳：加總必等於 actualTotalBonus
-    const makeStaff = (labels, weights, ratios) => {
-      const amounts = splitByWeights(actualTotalBonus, weights);
-      return labels.map((label, i) => ({
-        label,
-        amount: amounts[i],
-        ratio: ratios[i],
-        weight: weights[i],
-      }));
-    };
+    const weights = staffList.map((p) => Math.max(0, Number(p.weight) || 0));
+    const totalWeight = weights.reduce((a, b) => a + b, 0);
+    const amounts =
+      totalWeight > 0
+        ? splitByWeights(kpi.actualTotalBonus, weights)
+        : weights.map(() => 0);
+    const staffDistribution = staffList.map((p, i) => ({
+      label: p.name || `員工 ${i + 1}`,
+      amount: amounts[i],
+      ratio:
+        totalWeight > 0
+          ? `${((weights[i] / totalWeight) * 100).toFixed(1)}%`
+          : "—",
+      weight: weights[i],
+    }));
 
-    let staffDistribution = [];
-    if (staffMode === "2_even") {
-      staffDistribution = makeStaff(
-        ["員工 A", "員工 B"],
-        [1, 1],
-        ["50%", "50%"]
-      );
-    } else if (staffMode === "3_even") {
-      staffDistribution = makeStaff(
-        ["員工 A", "員工 B", "員工 C"],
-        [1, 1, 1],
-        ["33.3%", "33.3%", "33.3%"]
-      );
-    } else if (staffMode === "3_weighted") {
-      staffDistribution = makeStaff(
-        ["資深人員 A", "資深人員 B", "新進人員 C"],
-        [2, 2, 1],
-        ["40%", "40%", "20%"]
-      );
-    }
+    return { ...kpi, staffDistribution };
+  }, [revenue, orderCount, bonusRate, staffList, effCounts, inventoryIncident]);
 
+  // 歷史列（含當月，依月份排序）
+  const historyRows = useMemo(
+    () =>
+      Object.keys(monthsData)
+        .sort()
+        .map((m) => {
+          const md = monthsData[m];
+          return { m, md, kpi: computeMonth(md), counts: effectiveCounts(md) };
+        }),
+    [monthsData]
+  );
+
+  const recentStats = useMemo(() => {
+    const rows = [...historyRows].reverse().slice(0, 3);
+    if (rows.length === 0) return null;
     return {
-      scores: {
-        fulfillmentQualityScore,
-        fulfillmentScore,
-        inventoryScore,
-      },
-      rawTotalScore,
-      finalScore,
-      isQualityMonth,
-      isBelowThreshold,
-      vetoReason,
-      bonusPool,
-      actualTotalBonus,
-      staffDistribution,
+      n: rows.length,
+      avgScore: Math.round(
+        rows.reduce((a, r) => a + r.kpi.finalScore, 0) / rows.length
+      ),
+      avgBonus: Math.round(
+        rows.reduce((a, r) => a + r.kpi.actualTotalBonus, 0) / rows.length
+      ),
     };
-  }, [
-    revenue,
-    orderCount,
-    staffMode,
-    fulfillmentQualityErrors,
-    fulfillmentErrors,
-    inventoryErrors,
-    inventoryIncident,
-  ]);
+  }, [historyRows]);
+
+  // ── 人力配置編輯 ──
+  const updateStaff = (idx, patch) =>
+    setStaffList((list) =>
+      list.map((p, i) => (i === idx ? { ...p, ...patch } : p))
+    );
+  const removeStaff = (idx) =>
+    setStaffList((list) =>
+      list.length <= 1 ? list : list.filter((_, i) => i !== idx)
+    );
+  const addStaff = () =>
+    setStaffList((list) =>
+      list.length >= 8
+        ? list
+        : [
+            ...list,
+            {
+              name: `員工 ${String.fromCharCode(65 + list.length)}`,
+              weight: 1,
+            },
+          ]
+    );
+  const applyPreset = (key) =>
+    setStaffList(STAFF_PRESETS[key].map((p) => ({ ...p })));
+
+  // 共用小樣式
+  const inputS = {
+    padding: "9px 10px",
+    borderRadius: 10,
+    border: "1.5px solid #e2e8f0",
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#334155",
+    fontFamily: "inherit",
+    outline: "none",
+    background: "#fff",
+  };
+  const navBtnS = {
+    width: 30,
+    height: 30,
+    borderRadius: 8,
+    border: "1.5px solid #e2e8f0",
+    background: "#fff",
+    color: "#64748b",
+    cursor: "pointer",
+    fontSize: 15,
+    fontWeight: 700,
+  };
+  const linkBtnS = {
+    border: "none",
+    background: "none",
+    color: "#2563eb",
+    cursor: "pointer",
+    fontWeight: 700,
+    fontSize: 11,
+    padding: 0,
+  };
 
   const baseOrdersDisplay = Math.max(orderCount, 1000);
   const isUsingMinBase = orderCount < 1000;
@@ -623,7 +970,7 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
-              <Icons.package /> BESTEA 內部管理 ・ v3.5
+              <Icons.package /> BESTEA 內部管理 ・ v4.0
             </div>
             <h1
               style={{
@@ -666,22 +1013,62 @@ export default function App() {
                 </span>
               )}
             </p>
-            <button
-              onClick={handleReset}
+            <div
               style={{
-                marginTop: 8,
-                fontSize: 11,
-                fontWeight: 600,
-                color: "#94a3b8",
-                background: "none",
-                border: "1px solid #e2e8f0",
-                borderRadius: 8,
-                padding: "4px 12px",
-                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginTop: 10,
+                flexWrap: "wrap",
               }}
             >
-              清除數據並重置
-            </button>
+              <button
+                onClick={() => shiftMonth(-1)}
+                aria-label="上一月"
+                style={navBtnS}
+              >
+                ‹
+              </button>
+              <input
+                type="month"
+                value={month}
+                onChange={(e) => switchMonth(e.target.value)}
+                aria-label="選擇月份"
+                style={{
+                  padding: "5px 10px",
+                  borderRadius: 8,
+                  border: "1.5px solid #e2e8f0",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: "#334155",
+                  fontFamily: "inherit",
+                  outline: "none",
+                  background: "#fff",
+                }}
+              />
+              <button
+                onClick={() => shiftMonth(1)}
+                aria-label="下一月"
+                style={navBtnS}
+              >
+                ›
+              </button>
+              <button
+                onClick={handleReset}
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: "#94a3b8",
+                  background: "none",
+                  border: "1px solid #e2e8f0",
+                  borderRadius: 8,
+                  padding: "5px 12px",
+                  cursor: "pointer",
+                }}
+              >
+                清除當月數據
+              </button>
+            </div>
           </div>
 
           {/* Revenue + Orders */}
@@ -797,7 +1184,77 @@ export default function App() {
                   marginBottom: 4,
                 }}
               >
-                獎金池 (0.1%)
+                獎金池比例
+              </div>
+              <div
+                style={{ display: "flex", alignItems: "baseline", gap: 2 }}
+              >
+                <input
+                  type="number"
+                  min="0"
+                  max="10"
+                  step="0.05"
+                  value={bonusRate}
+                  onChange={(e) =>
+                    setBonusRate(
+                      Math.min(10, Math.max(0, Number(e.target.value) || 0))
+                    )
+                  }
+                  aria-label="獎金池比例（%）"
+                  style={{
+                    fontSize: 22,
+                    fontWeight: 800,
+                    color: "#1e293b",
+                    border: "none",
+                    outline: "none",
+                    width: 64,
+                    background: "transparent",
+                    fontFamily: "inherit",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                />
+                <span
+                  style={{ fontSize: 15, fontWeight: 800, color: "#64748b" }}
+                >
+                  %
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                {[0.1, 0.2, 0.3].map((r) => (
+                  <button
+                    key={r}
+                    onClick={() => setBonusRate(r)}
+                    style={{
+                      fontSize: 9,
+                      fontWeight: 700,
+                      padding: "2px 8px",
+                      borderRadius: 6,
+                      cursor: "pointer",
+                      border:
+                        bonusRate === r
+                          ? "1px solid #2563eb"
+                          : "1px solid #e2e8f0",
+                      background: bonusRate === r ? "#eff6ff" : "#fff",
+                      color: bonusRate === r ? "#2563eb" : "#94a3b8",
+                    }}
+                  >
+                    {r}%
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={{ width: 1, height: 40, background: "#e2e8f0" }} />
+            <div>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: "#94a3b8",
+                  letterSpacing: "0.08em",
+                  marginBottom: 4,
+                }}
+              >
+                獎金池金額
               </div>
               <div
                 style={{
@@ -855,11 +1312,57 @@ export default function App() {
                 >
                   KPI 扣分項錄入
                 </span>
-                <span
-                  style={{ fontSize: 11, color: "#94a3b8", fontWeight: 500 }}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    flexWrap: "wrap",
+                  }}
                 >
-                  比率以 {baseOrdersDisplay.toLocaleString()} 筆為基準計算
-                </span>
+                  <div
+                    style={{
+                      display: "flex",
+                      borderRadius: 8,
+                      overflow: "hidden",
+                      border: "1px solid #475569",
+                    }}
+                  >
+                    <button
+                      onClick={() => setAutoFromLog(true)}
+                      style={{
+                        padding: "5px 10px",
+                        fontSize: 11,
+                        fontWeight: 700,
+                        border: "none",
+                        cursor: "pointer",
+                        background: autoFromLog ? "#2563eb" : "transparent",
+                        color: autoFromLog ? "#fff" : "#94a3b8",
+                      }}
+                    >
+                      登記表自動
+                    </button>
+                    <button
+                      onClick={() => setAutoFromLog(false)}
+                      style={{
+                        padding: "5px 10px",
+                        fontSize: 11,
+                        fontWeight: 700,
+                        border: "none",
+                        cursor: "pointer",
+                        background: !autoFromLog ? "#2563eb" : "transparent",
+                        color: !autoFromLog ? "#fff" : "#94a3b8",
+                      }}
+                    >
+                      手動試算
+                    </button>
+                  </div>
+                  <span
+                    style={{ fontSize: 11, color: "#94a3b8", fontWeight: 500 }}
+                  >
+                    基準 {baseOrdersDisplay.toLocaleString()} 筆
+                  </span>
+                </div>
               </div>
 
               <div style={{ padding: "8px 0" }}>
@@ -870,8 +1373,9 @@ export default function App() {
                   weight={55}
                   score={results.scores.fulfillmentQualityScore}
                   maxScore={55}
-                  value={fulfillmentQualityErrors}
+                  value={effCounts.fq}
                   onChange={setFulfillmentQualityErrors}
+                  locked={autoFromLog}
                   rules={RATE_THRESHOLDS.fulfillmentQuality.map((r) => ({
                     range: r.label,
                     score: r.score,
@@ -908,8 +1412,9 @@ export default function App() {
                   weight={25}
                   score={results.scores.fulfillmentScore}
                   maxScore={25}
-                  value={fulfillmentErrors}
+                  value={effCounts.fulfill}
                   onChange={setFulfillmentErrors}
+                  locked={autoFromLog}
                   rules={FULFILLMENT_RULES}
                   openTooltip={openTooltip}
                   tooltipKey="fulfill"
@@ -937,8 +1442,9 @@ export default function App() {
                   weight={20}
                   score={results.scores.inventoryScore}
                   maxScore={20}
-                  value={inventoryErrors}
+                  value={effCounts.inv}
                   onChange={setInventoryErrors}
+                  locked={autoFromLog}
                   rules={INVENTORY_RULES}
                   openTooltip={openTooltip}
                   tooltipKey="inv"
@@ -978,6 +1484,208 @@ export default function App() {
                   }
                 />
               </div>
+            </div>
+
+            {/* 錯誤登記表 */}
+            <div
+              style={{
+                background: "#fff",
+                borderRadius: 20,
+                overflow: "hidden",
+                boxShadow:
+                  "0 1px 3px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.04)",
+                border: "1px solid #e2e8f0",
+              }}
+            >
+              <div
+                style={{
+                  padding: "14px 20px",
+                  borderBottom: "1px solid #f1f5f9",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
+                  gap: 8,
+                }}
+              >
+                <span
+                  style={{
+                    fontWeight: 700,
+                    fontSize: 14,
+                    color: "#475569",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                  }}
+                >
+                  <Icons.alert /> 錯誤登記表（{monthLabel(month)}・
+                  {logs.length} 筆）
+                </span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {ERROR_CATEGORIES.map((c) => (
+                    <span
+                      key={c.key}
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        padding: "3px 8px",
+                        borderRadius: 6,
+                        background: "#f1f5f9",
+                        color: c.color,
+                      }}
+                    >
+                      {c.label.slice(0, 1)} {logTally[c.key]} 件
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              {/* 輸入列 */}
+              <div
+                style={{
+                  padding: "14px 20px",
+                  borderBottom: "1px solid #f1f5f9",
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 8,
+                  alignItems: "center",
+                }}
+              >
+                <input
+                  type="date"
+                  value={logDate}
+                  onChange={(e) => setLogDate(e.target.value)}
+                  aria-label="發生日期"
+                  style={inputS}
+                />
+                <select
+                  value={logCategory}
+                  onChange={(e) => changeLogCategory(e.target.value)}
+                  aria-label="錯誤分類"
+                  style={inputS}
+                >
+                  {ERROR_CATEGORIES.map((c) => (
+                    <option key={c.key} value={c.key}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={logType}
+                  onChange={(e) => setLogType(e.target.value)}
+                  aria-label="錯誤類型"
+                  style={{ ...inputS, maxWidth: 180 }}
+                >
+                  {ERROR_TYPES[logCategory].map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  placeholder="訂單編號（選填）"
+                  value={logOrderNo}
+                  onChange={(e) => setLogOrderNo(e.target.value)}
+                  aria-label="訂單編號"
+                  style={{ ...inputS, width: 130 }}
+                />
+                <select
+                  value={logSource}
+                  onChange={(e) => setLogSource(e.target.value)}
+                  aria-label="發現方式"
+                  style={inputS}
+                >
+                  {DISCOVERY_SOURCES.map((sx) => (
+                    <option key={sx} value={sx}>
+                      {sx}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={addLog}
+                  style={{
+                    padding: "9px 16px",
+                    borderRadius: 10,
+                    border: "none",
+                    background: "linear-gradient(135deg,#2563eb,#3b82f6)",
+                    color: "#fff",
+                    fontWeight: 700,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  ＋ 記一筆
+                </button>
+              </div>
+
+              {/* 紀錄清單 */}
+              {logs.length === 0 ? (
+                <div
+                  style={{ padding: "16px 20px", fontSize: 12, color: "#94a3b8" }}
+                >
+                  本月尚無錯誤紀錄
+                  {autoFromLog ? "，三大項自動計 0 件（滿分）" : ""}
+                  。發生當下記一筆，月底自動加總計分。
+                </div>
+              ) : (
+                <div style={{ maxHeight: 240, overflowY: "auto" }}>
+                  {logs.map((e) => {
+                    const cat = ERROR_CATEGORIES.find(
+                      (c) => c.key === e.category
+                    );
+                    return (
+                      <div
+                        key={e.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          padding: "9px 20px",
+                          borderBottom: "1px solid #f8fafc",
+                          fontSize: 12,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span
+                          style={{
+                            color: "#94a3b8",
+                            fontVariantNumeric: "tabular-nums",
+                            fontWeight: 600,
+                          }}
+                        >
+                          {e.date}
+                        </span>
+                        <span style={{ fontWeight: 800, color: cat?.color }}>
+                          {cat?.label}
+                        </span>
+                        <span style={{ color: "#334155", fontWeight: 600 }}>
+                          {e.type}
+                        </span>
+                        {e.orderNo && (
+                          <span style={{ color: "#64748b" }}>#{e.orderNo}</span>
+                        )}
+                        <span style={{ color: "#94a3b8" }}>{e.source}</span>
+                        <button
+                          onClick={() => removeLog(e.id)}
+                          aria-label="刪除紀錄"
+                          style={{
+                            marginLeft: "auto",
+                            border: "none",
+                            background: "none",
+                            color: "#dc2626",
+                            cursor: "pointer",
+                            fontWeight: 700,
+                            fontSize: 13,
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             {/* Staff Config */}
@@ -1024,88 +1732,181 @@ export default function App() {
                       fontWeight: 500,
                     }}
                   >
-                    選擇當前人數與分配規則
+                    自訂人數（1–8）、姓名與權重；權重比例＝分配比例
                   </div>
                 </div>
               </div>
 
               <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(3, 1fr)",
-                  gap: 10,
-                }}
+                style={{ display: "flex", flexDirection: "column", gap: 8 }}
               >
-                {[
-                  { key: "2_even", name: "2 人平分", desc: "1 : 1", tag: null },
-                  {
-                    key: "3_even",
-                    name: "3 人平分",
-                    desc: "1 : 1 : 1",
-                    tag: "目前",
-                  },
-                  {
-                    key: "3_weighted",
-                    name: "3 人加權",
-                    desc: "2 : 2 : 1",
-                    tag: "未來",
-                  },
-                ].map((opt) => {
-                  const active = staffMode === opt.key;
+                {staffList.map((p, idx) => {
+                  const totalW = staffList.reduce(
+                    (a, b) => a + (Number(b.weight) || 0),
+                    0
+                  );
+                  const w = Number(p.weight) || 0;
+                  const pct =
+                    totalW > 0 ? ((w / totalW) * 100).toFixed(1) : "0.0";
                   return (
-                    <button
-                      key={opt.key}
-                      onClick={() => setStaffMode(opt.key)}
+                    <div
+                      key={idx}
                       style={{
-                        padding: "14px 12px",
-                        borderRadius: 14,
-                        cursor: "pointer",
-                        border: active
-                          ? "2px solid #2563eb"
-                          : "1.5px solid #e2e8f0",
-                        background: active
-                          ? "linear-gradient(135deg, #2563eb, #3b82f6)"
-                          : "#fff",
-                        color: active ? "#fff" : "#475569",
-                        position: "relative",
                         display: "flex",
-                        flexDirection: "column",
                         alignItems: "center",
-                        gap: 4,
+                        gap: 8,
+                        flexWrap: "wrap",
                       }}
                     >
-                      {opt.tag && (
-                        <span
-                          style={{
-                            position: "absolute",
-                            top: -8,
-                            right: -4,
-                            fontSize: 9,
-                            fontWeight: 800,
-                            background: active ? "#fbbf24" : "#e2e8f0",
-                            color: active ? "#78350f" : "#64748b",
-                            padding: "2px 8px",
-                            borderRadius: 20,
-                          }}
-                        >
-                          {opt.tag}
-                        </span>
-                      )}
-                      <span style={{ fontWeight: 700, fontSize: 14 }}>
-                        {opt.name}
-                      </span>
+                      <input
+                        type="text"
+                        value={p.name}
+                        onChange={(e) =>
+                          updateStaff(idx, { name: e.target.value })
+                        }
+                        aria-label="人員姓名"
+                        placeholder={`員工 ${idx + 1}`}
+                        style={{
+                          flex: 1,
+                          minWidth: 110,
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1.5px solid #e2e8f0",
+                          fontSize: 13,
+                          fontWeight: 600,
+                          color: "#334155",
+                          fontFamily: "inherit",
+                          outline: "none",
+                        }}
+                      />
                       <span
                         style={{
                           fontSize: 11,
-                          opacity: 0.7,
-                          fontWeight: 500,
+                          color: "#94a3b8",
+                          fontWeight: 700,
                         }}
                       >
-                        比例 {opt.desc}
+                        權重
                       </span>
-                    </button>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={p.weight}
+                        onChange={(e) =>
+                          updateStaff(idx, {
+                            weight: Math.max(0, Number(e.target.value) || 0),
+                          })
+                        }
+                        aria-label="分配權重"
+                        style={{
+                          width: 64,
+                          padding: "10px 8px",
+                          borderRadius: 10,
+                          border: "1.5px solid #e2e8f0",
+                          fontSize: 14,
+                          fontWeight: 700,
+                          textAlign: "center",
+                          color: "#1e293b",
+                          fontFamily: "inherit",
+                          outline: "none",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      />
+                      <span
+                        style={{
+                          width: 52,
+                          fontSize: 11,
+                          fontWeight: 700,
+                          color: "#2563eb",
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        {pct}%
+                      </span>
+                      <button
+                        onClick={() => removeStaff(idx)}
+                        disabled={staffList.length <= 1}
+                        aria-label="移除人員"
+                        style={{
+                          width: 32,
+                          height: 32,
+                          borderRadius: 8,
+                          border: "1.5px solid #fecaca",
+                          background: "#fff",
+                          color: "#dc2626",
+                          cursor:
+                            staffList.length <= 1 ? "not-allowed" : "pointer",
+                          opacity: staffList.length <= 1 ? 0.3 : 1,
+                          fontSize: 14,
+                          fontWeight: 700,
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
                   );
                 })}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    marginTop: 4,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <button
+                    onClick={addStaff}
+                    disabled={staffList.length >= 8}
+                    style={{
+                      padding: "8px 14px",
+                      borderRadius: 10,
+                      border: "1.5px dashed #93c5fd",
+                      background: "#eff6ff",
+                      color: "#2563eb",
+                      fontWeight: 700,
+                      fontSize: 12,
+                      cursor:
+                        staffList.length >= 8 ? "not-allowed" : "pointer",
+                      opacity: staffList.length >= 8 ? 0.4 : 1,
+                    }}
+                  >
+                    ＋ 新增人員
+                  </button>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      color: "#94a3b8",
+                      fontWeight: 600,
+                    }}
+                  >
+                    快速範本：
+                  </span>
+                  {[
+                    { key: "2_even", label: "2人平分" },
+                    { key: "3_even", label: "3人平分" },
+                    { key: "3_weighted", label: "3人加權 2:2:1" },
+                  ].map((pr) => (
+                    <button
+                      key={pr.key}
+                      onClick={() => applyPreset(pr.key)}
+                      style={{
+                        padding: "6px 10px",
+                        borderRadius: 8,
+                        border: "1px solid #e2e8f0",
+                        background: "#f8fafc",
+                        color: "#64748b",
+                        fontWeight: 600,
+                        fontSize: 11,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {pr.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
@@ -1529,11 +2330,12 @@ export default function App() {
               >
                 公式速查
               </div>
-              <div>獎金池 = 月營收 × 0.1%</div>
+              <div>獎金池 = 月營收 × {bonusRate}%（比例可調）</div>
               <div>
                 出貨包裝採比率制（基準 max(訂單量, 1000) 筆）
               </div>
               <div>訂單履行採重罰階梯、庫存採硬門檻（點各項 ⓘ 查看）</div>
+              <div>計分件數 = 登記表自動加總（可切換手動試算模擬）</div>
               <div>實際獎金 = 獎金池 × (KPI得分 ÷ 100)</div>
               <div>品質穩定月 = 全項目零錯誤 → 得分 ×1.2（上限120）</div>
               <div style={{ color: "#dc2626", fontWeight: 600 }}>
@@ -1548,6 +2350,207 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* 月份歷史與趨勢 */}
+        {historyRows.length > 0 && (
+          <div
+            style={{
+              marginTop: 24,
+              background: "#fff",
+              borderRadius: 20,
+              border: "1px solid #e2e8f0",
+              boxShadow:
+                "0 1px 3px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.04)",
+              overflow: "hidden",
+              animation: "slideUp 0.8s ease-out",
+            }}
+          >
+            <div
+              style={{
+                padding: "14px 20px",
+                borderBottom: "1px solid #f1f5f9",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <span
+                style={{
+                  fontWeight: 700,
+                  fontSize: 14,
+                  color: "#475569",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <Icons.trending /> 月份歷史與趨勢
+              </span>
+              {recentStats && (
+                <span
+                  style={{ fontSize: 11, color: "#64748b", fontWeight: 600 }}
+                >
+                  近 {recentStats.n} 月平均 {recentStats.avgScore} 分 ・
+                  平均獎金 ${recentStats.avgBonus.toLocaleString()}
+                </span>
+              )}
+            </div>
+
+            {/* 趨勢長條圖 */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-end",
+                gap: 10,
+                padding: "18px 20px 10px",
+                overflowX: "auto",
+              }}
+            >
+              {historyRows.map((r) => (
+                <div
+                  key={r.m}
+                  onClick={() => switchMonth(r.m)}
+                  title={`${monthLabel(r.m)}：${r.kpi.finalScore} 分・$${r.kpi.actualTotalBonus.toLocaleString()}`}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: 4,
+                    cursor: "pointer",
+                    minWidth: 40,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: "#64748b",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {r.kpi.finalScore}
+                  </span>
+                  <div
+                    style={{
+                      width: 26,
+                      height: Math.max(6, (r.kpi.finalScore / 120) * 80),
+                      borderRadius: 6,
+                      background: barColor(r.kpi),
+                      outline:
+                        r.m === month ? "2px solid #1e293b" : "none",
+                      outlineOffset: 2,
+                    }}
+                  />
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: r.m === month ? "#1e293b" : "#94a3b8",
+                    }}
+                  >
+                    {Number(r.m.split("-")[1])}月
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {/* 明細表 */}
+            <div>
+              {[...historyRows].reverse().map((r) => (
+                <div
+                  key={r.m}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 12,
+                    padding: "10px 20px",
+                    borderTop: "1px solid #f8fafc",
+                    fontSize: 12,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    style={{ fontWeight: 800, color: "#334155", minWidth: 88 }}
+                  >
+                    {monthLabel(r.m)}
+                    {r.m === month && (
+                      <span
+                        style={{
+                          fontSize: 9,
+                          color: "#2563eb",
+                          marginLeft: 4,
+                        }}
+                      >
+                        目前
+                      </span>
+                    )}
+                  </span>
+                  <span
+                    style={{
+                      color: "#64748b",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    ①{r.counts.fq} ②{r.counts.fulfill} ③{r.counts.inv}
+                    {r.md.inventoryIncident ? "・事故" : ""}
+                  </span>
+                  <span
+                    style={{
+                      fontWeight: 800,
+                      color: "#1e293b",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {r.kpi.finalScore} 分
+                  </span>
+                  <span
+                    style={{
+                      fontWeight: 800,
+                      color:
+                        r.kpi.actualTotalBonus > 0 ? "#1e40af" : "#94a3b8",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    ${r.kpi.actualTotalBonus.toLocaleString()}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 800,
+                      padding: "2px 8px",
+                      borderRadius: 6,
+                      ...statusStyle(r.kpi),
+                    }}
+                  >
+                    {statusText(r.kpi)}
+                  </span>
+                  <span
+                    style={{ marginLeft: "auto", display: "flex", gap: 10 }}
+                  >
+                    {r.m !== month && (
+                      <>
+                        <button
+                          onClick={() => switchMonth(r.m)}
+                          style={linkBtnS}
+                        >
+                          開啟
+                        </button>
+                        <button
+                          onClick={() => deleteMonth(r.m)}
+                          style={{ ...linkBtnS, color: "#dc2626" }}
+                        >
+                          刪除
+                        </button>
+                      </>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1562,6 +2565,7 @@ function KpiRow({
   maxScore,
   value,
   onChange,
+  locked,
   rules,
   openTooltip,
   tooltipKey,
@@ -1639,7 +2643,37 @@ function KpiRow({
           {extra}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <Stepper value={value} onChange={onChange} danger={value > 0} />
+          {locked ? (
+            <div style={{ textAlign: "center", minWidth: 96 }}>
+              <div
+                style={{
+                  fontSize: 9,
+                  fontWeight: 700,
+                  color: "#94a3b8",
+                  letterSpacing: "0.05em",
+                }}
+              >
+                登記表加總
+              </div>
+              <div
+                style={{
+                  fontSize: 28,
+                  fontWeight: 800,
+                  fontVariantNumeric: "tabular-nums",
+                  color: value > 0 ? "#ef4444" : "#22c55e",
+                }}
+              >
+                {value}
+                <span
+                  style={{ fontSize: 12, color: "#94a3b8", marginLeft: 2 }}
+                >
+                  件
+                </span>
+              </div>
+            </div>
+          ) : (
+            <Stepper value={value} onChange={onChange} danger={value > 0} />
+          )}
           <ScoreBadge score={score} max={maxScore} />
         </div>
       </div>
