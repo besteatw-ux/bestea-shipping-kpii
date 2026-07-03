@@ -825,7 +825,6 @@ export default function App() {
       if (unsubAuth) unsubAuth();
       if (writeTimer.current) clearTimeout(writeTimer.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── 月份切換 ──
