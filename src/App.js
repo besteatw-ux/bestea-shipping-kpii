@@ -15,6 +15,8 @@ import {
 
 /* ─────────────────────────────────────────────
    BESTEA 出貨暨庫存管理 KPI 試算工具
+   目前版本：v4.1（版本沿革由新到舊如下）
+
    v3.4 — 嚴格校準版（依老闆回饋調整）
    相對 v3.3 的變更：
 
@@ -479,6 +481,19 @@ function monthLabel(m) {
   return `${y}年${Number(mm)}月`;
 }
 
+// 檢視月份的日期範圍（登記表日期限制在當月內，符合「以發現月計入」）
+function monthDateRange(m) {
+  const [y, mm] = m.split("-").map(Number);
+  const lastDay = new Date(y, mm, 0).getDate();
+  return { min: `${m}-01`, max: `${m}-${String(lastDay).padStart(2, "0")}` };
+}
+
+// 登記表預設日期：檢視月=真實當月 → 今天；否則該月 1 號
+function defaultLogDate(m) {
+  const today = todayStr();
+  return today.startsWith(m) ? today : `${m}-01`;
+}
+
 // ── 月份資料 ──
 function defaultMonthData(seed) {
   return {
@@ -683,18 +698,21 @@ export default function App() {
   const writeTimer = useRef(null);
 
   // 登記表輸入表單
-  const [logDate, setLogDate] = useState(todayStr());
+  const [logDate, setLogDate] = useState(defaultLogDate(init.currentMonth));
   const [logCategory, setLogCategory] = useState("fq");
   const [logType, setLogType] = useState(ERROR_TYPES.fq[0]);
   const [logOrderNo, setLogOrderNo] = useState("");
   const [logSource, setLogSource] = useState(DISCOVERY_SOURCES[0]);
 
   // 雲端寫入（去抖動 600ms）
+  const pendingStoreRef = useRef(null);
   const scheduleCloudWrite = (store) => {
     if (!readyRef.current || !fbDocRef.current) return;
+    pendingStoreRef.current = store;
     setSyncStatus("saving");
     if (writeTimer.current) clearTimeout(writeTimer.current);
     writeTimer.current = setTimeout(() => {
+      pendingStoreRef.current = null;
       setDoc(fbDocRef.current, store)
         .then(() => setSyncStatus("synced"))
         .catch((e) => {
@@ -703,6 +721,26 @@ export default function App() {
         });
     }, 600);
   };
+
+  // 關閉/切走分頁時，立即送出還在等去抖動的寫入（避免掉最後一筆）
+  useEffect(() => {
+    const flush = () => {
+      if (pendingStoreRef.current && fbDocRef.current && readyRef.current) {
+        if (writeTimer.current) clearTimeout(writeTimer.current);
+        setDoc(fbDocRef.current, pendingStoreRef.current).catch(() => {});
+        pendingStoreRef.current = null;
+      }
+    };
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onHidden);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onHidden);
+    };
+  }, []);
 
   // 任何變更 → 寫進當月快照 → 本機快取 + 雲端
   useEffect(() => {
@@ -766,6 +804,7 @@ export default function App() {
         loadMonthData(md);
         setMonth(m);
         monthRef.current = m;
+        setLogDate(defaultLogDate(m));
       };
 
       unsubAuth = onAuthStateChanged(auth, async (u) => {
@@ -849,6 +888,7 @@ export default function App() {
       defaultMonthData({ revenue, orderCount, bonusRate, staffList });
     loadMonthData(target);
     setMonth(m);
+    setLogDate(defaultLogDate(m)); // 登記日期跟著檢視月份走
   };
 
   const shiftMonth = (delta) => {
@@ -874,19 +914,25 @@ export default function App() {
   const handleReset = () => {
     if (
       !window.confirm(
-        `確定要清除 ${monthLabel(month)} 的數據嗎？（其他月份不受影響）`
+        `確定要清除 ${monthLabel(month)} 的錯誤件數與登記紀錄嗎？\n（營收、單量、獎金池比例、人力配置會保留；其他月份不受影響）`
       )
     )
       return;
-    loadMonthData(defaultMonthData());
+    // 只清錯誤與登記，保留本月設定
+    loadMonthData(
+      defaultMonthData({ revenue, orderCount, bonusRate, staffList })
+    );
   };
 
   // ── 登記表操作 ──
   const addLog = () => {
+    // 日期保險校正：不在檢視月份內 → 改用該月預設日（以發現月計入）
+    const safeDate =
+      logDate && logDate.startsWith(month) ? logDate : defaultLogDate(month);
     setLogs((l) => [
       {
         id: Date.now(),
-        date: logDate || todayStr(),
+        date: safeDate,
         category: logCategory,
         type: logType,
         orderNo: logOrderNo.trim(),
@@ -1219,7 +1265,7 @@ export default function App() {
                   cursor: "pointer",
                 }}
               >
-                清除當月數據
+                清除當月錯誤紀錄
               </button>
             </div>
           </div>
@@ -1558,7 +1604,7 @@ export default function App() {
                   }}
                 />
 
-                {/* ② 訂單履行 — v3.3 階梯制 */}
+                {/* ② 訂單履行 — 比率制（隨單量放大）+ 否決 */}
                 <KpiRow
                   title="訂單履行時效"
                   subtitle="漏寄（收單未出貨）、逾時出貨（超過承諾時限）、誤放、遺漏處理、物流單號未回填、補寄/換貨逾時、平台（蝦皮）逾期出貨"
@@ -1588,7 +1634,7 @@ export default function App() {
                   }}
                 />
 
-                {/* ③ 庫存管理 — v3.3 階梯制 */}
+                {/* ③ 庫存管理 — 固定硬門檻 + 事故條款 */}
                 <KpiRow
                   title="庫存管理穩定度"
                   subtitle="盤點帳貨差異、入庫驗收未核對、效期疏失（未先進先出/過期短效未回報）"
@@ -1707,6 +1753,8 @@ export default function App() {
                 <input
                   type="date"
                   value={logDate}
+                  min={monthDateRange(month).min}
+                  max={monthDateRange(month).max}
                   onChange={(e) => setLogDate(e.target.value)}
                   aria-label="發生日期"
                   style={inputS}
