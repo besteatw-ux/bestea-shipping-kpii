@@ -15,7 +15,14 @@ import {
 
 /* ─────────────────────────────────────────────
    BESTEA 出貨暨庫存管理 KPI 試算工具
-   目前版本：v4.1（版本沿革由新到舊如下）
+   目前版本：v4.2（版本沿革由新到舊如下）
+
+   v4.2 — 錯誤登記表加「責任人員」：
+   - 登記時可直接選是誰出的錯（選項連動人力配置名單，另有
+     「未指定」與「共同/無法歸屬」）
+   - 登記表卡片顯示各人本月件數；人員獎金分配明細同步顯示件數
+   - 計分與獎金分配邏輯不變（仍為部門共同 KPI），人員欄純作
+     責任追蹤與檢討用；離職/改名後舊紀錄保留原始姓名
 
    v3.4 — 嚴格校準版（依老闆回饋調整）
    相對 v3.3 的變更：
@@ -462,6 +469,10 @@ const DISCOVERY_SOURCES = [
   "其他",
 ];
 
+// 責任人員的兩個固定選項（其餘由人力配置名單帶入）
+const STAFF_UNASSIGNED = "未指定";
+const STAFF_SHARED = "共同/無法歸屬";
+
 // ── 日期輔助 ──
 function currentMonthStr() {
   const d = new Date();
@@ -703,6 +714,7 @@ export default function App() {
   const [logType, setLogType] = useState(ERROR_TYPES.fq[0]);
   const [logOrderNo, setLogOrderNo] = useState("");
   const [logSource, setLogSource] = useState(DISCOVERY_SOURCES[0]);
+  const [logStaff, setLogStaff] = useState(STAFF_UNASSIGNED);
 
   // 雲端寫入（去抖動 600ms）
   const pendingStoreRef = useRef(null);
@@ -937,6 +949,7 @@ export default function App() {
         type: logType,
         orderNo: logOrderNo.trim(),
         source: logSource,
+        staff: logStaff,
       },
       ...l,
     ]);
@@ -960,6 +973,33 @@ export default function App() {
     () => countToExceedRate(orderCount, FULFILLMENT_VETO_RATE),
     [orderCount]
   );
+
+  // 責任人員選項＝人力配置名單 ＋ 未指定／共同
+  const staffOptions = useMemo(() => {
+    const names = staffList
+      .map((p, i) => (p.name || "").trim() || `員工 ${i + 1}`)
+      .filter((n, i, arr) => arr.indexOf(n) === i);
+    return [...names, STAFF_SHARED, STAFF_UNASSIGNED];
+  }, [staffList]);
+
+  // 選中的人員若已從名單移除，仍保留在選項中避免值消失
+  const staffSelectOptions = useMemo(
+    () =>
+      staffOptions.includes(logStaff)
+        ? staffOptions
+        : [logStaff, ...staffOptions],
+    [staffOptions, logStaff]
+  );
+
+  // 各人本月件數（含未指定／共同）
+  const staffTally = useMemo(() => {
+    const t = {};
+    logs.forEach((l) => {
+      const k = l.staff || STAFF_UNASSIGNED;
+      t[k] = (t[k] || 0) + 1;
+    });
+    return t;
+  }, [logs]);
 
   // 計分件數來源：登記表自動加總 or 手動輸入
   const logTally = useMemo(() => tallyLogs(logs), [logs]);
@@ -1153,7 +1193,7 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
-              <Icons.package /> BESTEA 內部管理 ・ v4.1
+              <Icons.package /> BESTEA 內部管理 ・ v4.2
             </div>
             <h1
               style={{
@@ -1739,6 +1779,59 @@ export default function App() {
                 </div>
               </div>
 
+              {/* 各人件數 */}
+              {logs.length > 0 && (
+                <div
+                  style={{
+                    padding: "10px 20px",
+                    borderBottom: "1px solid #f1f5f9",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    flexWrap: "wrap",
+                    background: "#fcfdff",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: "#94a3b8",
+                      letterSpacing: "0.05em",
+                    }}
+                  >
+                    責任人員件數
+                  </span>
+                  {Object.entries(staffTally)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([name, n]) => (
+                      <span
+                        key={name}
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 700,
+                          padding: "3px 10px",
+                          borderRadius: 20,
+                          background:
+                            name === STAFF_UNASSIGNED
+                              ? "#f1f5f9"
+                              : name === STAFF_SHARED
+                              ? "#f5f3ff"
+                              : "#eff6ff",
+                          color:
+                            name === STAFF_UNASSIGNED
+                              ? "#94a3b8"
+                              : name === STAFF_SHARED
+                              ? "#7c3aed"
+                              : "#2563eb",
+                        }}
+                      >
+                        {name} {n} 件
+                      </span>
+                    ))}
+                </div>
+              )}
+
               {/* 輸入列 */}
               <div
                 style={{
@@ -1780,6 +1873,23 @@ export default function App() {
                   {ERROR_TYPES[logCategory].map((t) => (
                     <option key={t} value={t}>
                       {t}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={logStaff}
+                  onChange={(e) => setLogStaff(e.target.value)}
+                  aria-label="責任人員"
+                  style={{
+                    ...inputS,
+                    maxWidth: 150,
+                    color:
+                      logStaff === STAFF_UNASSIGNED ? "#94a3b8" : "#334155",
+                  }}
+                >
+                  {staffSelectOptions.map((n) => (
+                    <option key={n} value={n}>
+                      {n === STAFF_UNASSIGNED ? "人員：未指定" : n}
                     </option>
                   ))}
                 </select>
@@ -1862,6 +1972,28 @@ export default function App() {
                         </span>
                         <span style={{ color: "#334155", fontWeight: 600 }}>
                           {e.type}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            padding: "2px 8px",
+                            borderRadius: 6,
+                            background:
+                              !e.staff || e.staff === STAFF_UNASSIGNED
+                                ? "#f1f5f9"
+                                : e.staff === STAFF_SHARED
+                                ? "#f5f3ff"
+                                : "#eff6ff",
+                            color:
+                              !e.staff || e.staff === STAFF_UNASSIGNED
+                                ? "#94a3b8"
+                                : e.staff === STAFF_SHARED
+                                ? "#7c3aed"
+                                : "#2563eb",
+                          }}
+                        >
+                          {e.staff || STAFF_UNASSIGNED}
                         </span>
                         {e.orderNo && (
                           <span style={{ color: "#64748b" }}>#{e.orderNo}</span>
@@ -2451,10 +2583,30 @@ export default function App() {
                               color: "#94a3b8",
                               fontWeight: 700,
                               marginTop: 2,
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 6,
+                              flexWrap: "wrap",
                             }}
                           >
-                            權重 {staff.ratio}
-                            {staff.weight > 1 && ` (×${staff.weight})`}
+                            <span>
+                              權重 {staff.ratio}
+                              {staff.weight > 1 && ` (×${staff.weight})`}
+                            </span>
+                            <span
+                              style={{
+                                padding: "1px 7px",
+                                borderRadius: 20,
+                                background: staffTally[staff.label]
+                                  ? "#fef2f2"
+                                  : "#f0fdf4",
+                                color: staffTally[staff.label]
+                                  ? "#dc2626"
+                                  : "#16a34a",
+                              }}
+                            >
+                              本月 {staffTally[staff.label] || 0} 件
+                            </span>
                           </div>
                         </div>
                         <div
@@ -2508,6 +2660,9 @@ export default function App() {
               <div>同一筆訂單多項錯誤 → 以 1 件計，歸入最嚴重項目（不重複扣）</div>
               <div>錯誤以「發現當月」計入該月 KPI，跨月客訴不回溯改分</div>
               <div>作業無誤的客訴（口味偏好、物流延誤等非倉庫責任）不計件</div>
+              <div>
+                責任人員僅供追蹤檢討；KPI 與獎金仍為部門共同計算，不因人扣款
+              </div>
             </div>
 
             <div
